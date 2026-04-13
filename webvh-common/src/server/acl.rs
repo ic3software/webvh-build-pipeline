@@ -55,6 +55,59 @@ pub struct AclEntry {
     pub max_did_count: Option<u64>,
 }
 
+// -- Shared API request/response types for ACL routes --
+
+/// Request body for creating a new ACL entry (POST /acl).
+#[derive(Debug, Deserialize)]
+pub struct CreateAclRequest {
+    pub did: String,
+    pub role: Role,
+    pub label: Option<String>,
+    #[serde(default)]
+    pub max_total_size: Option<u64>,
+    #[serde(default)]
+    pub max_did_count: Option<u64>,
+}
+
+/// Request body for updating an existing ACL entry (PUT /acl/{did}).
+#[derive(Debug, Deserialize)]
+pub struct UpdateAclRequest {
+    pub role: Option<Role>,
+    pub label: Option<String>,
+    pub max_total_size: Option<u64>,
+    pub max_did_count: Option<u64>,
+}
+
+/// Serializable ACL entry returned in API responses.
+#[derive(Debug, Serialize)]
+pub struct AclEntryResponse {
+    pub did: String,
+    pub role: Role,
+    pub label: Option<String>,
+    pub created_at: u64,
+    pub max_total_size: Option<u64>,
+    pub max_did_count: Option<u64>,
+}
+
+impl From<AclEntry> for AclEntryResponse {
+    fn from(e: AclEntry) -> Self {
+        Self {
+            did: e.did,
+            role: e.role,
+            label: e.label,
+            created_at: e.created_at,
+            max_total_size: e.max_total_size,
+            max_did_count: e.max_did_count,
+        }
+    }
+}
+
+/// Response body for listing ACL entries (GET /acl).
+#[derive(Debug, Serialize)]
+pub struct AclListResponse {
+    pub entries: Vec<AclEntryResponse>,
+}
+
 impl AclEntry {
     /// Return the effective maximum total DID document size for this account.
     pub fn effective_max_total_size(&self, global_default: u64) -> u64 {

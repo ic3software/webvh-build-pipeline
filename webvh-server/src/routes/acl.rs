@@ -1,54 +1,25 @@
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use serde::{Deserialize, Serialize};
-
 use tracing::{info, warn};
 
-use crate::acl::{
-    AclEntry, Role, delete_acl_entry, get_acl_entry, list_acl_entries, store_acl_entry,
-};
+use crate::acl::{AclEntry, delete_acl_entry, get_acl_entry, list_acl_entries, store_acl_entry};
 use crate::auth::AdminAuth;
 use crate::auth::session::now_epoch;
 use crate::error::AppError;
 use crate::server::AppState;
+use affinidi_webvh_common::server::acl::{
+    AclEntryResponse, AclListResponse, CreateAclRequest, UpdateAclRequest,
+};
 
 // ---------- GET /acl ----------
-
-#[derive(Debug, Serialize)]
-pub struct AclListResponse {
-    pub entries: Vec<AclEntryResponse>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct AclEntryResponse {
-    pub did: String,
-    pub role: Role,
-    pub label: Option<String>,
-    pub created_at: u64,
-    pub max_total_size: Option<u64>,
-    pub max_did_count: Option<u64>,
-}
-
-impl From<AclEntry> for AclEntryResponse {
-    fn from(e: AclEntry) -> Self {
-        AclEntryResponse {
-            did: e.did,
-            role: e.role,
-            label: e.label,
-            created_at: e.created_at,
-            max_total_size: e.max_total_size,
-            max_did_count: e.max_did_count,
-        }
-    }
-}
 
 pub async fn list_acl(
     auth: AdminAuth,
     State(state): State<AppState>,
 ) -> Result<Json<AclListResponse>, AppError> {
-    let all_entries = list_acl_entries(&state.acl_ks).await?;
-    let entries: Vec<AclEntryResponse> = all_entries
+    let entries: Vec<AclEntryResponse> = list_acl_entries(&state.acl_ks)
+        .await?
         .into_iter()
         .map(AclEntryResponse::from)
         .collect();
@@ -58,23 +29,12 @@ pub async fn list_acl(
 
 // ---------- POST /acl ----------
 
-#[derive(Debug, Deserialize)]
-pub struct CreateAclRequest {
-    pub did: String,
-    pub role: Role,
-    pub label: Option<String>,
-    #[serde(default)]
-    pub max_total_size: Option<u64>,
-    #[serde(default)]
-    pub max_did_count: Option<u64>,
-}
-
 pub async fn create_acl(
     auth: AdminAuth,
     State(state): State<AppState>,
     Json(req): Json<CreateAclRequest>,
 ) -> Result<(StatusCode, Json<AclEntryResponse>), AppError> {
-    // Check if entry already exists
+    // Check for duplicates
     if get_acl_entry(&state.acl_ks, &req.did).await?.is_some() {
         warn!(caller = %auth.0.did, target_did = %req.did, "ACL create rejected: entry already exists");
         return Err(AppError::Conflict(format!(
@@ -94,19 +54,11 @@ pub async fn create_acl(
 
     store_acl_entry(&state.acl_ks, &entry).await?;
 
-    info!(audit = true, caller = %auth.0.did, did = %entry.did, role = %entry.role, "ACL entry created");
+    info!(caller = %auth.0.did, did = %entry.did, role = %entry.role, "ACL entry created");
     Ok((StatusCode::CREATED, Json(AclEntryResponse::from(entry))))
 }
 
 // ---------- PUT /acl/{did} ----------
-
-#[derive(Debug, Deserialize)]
-pub struct UpdateAclRequest {
-    pub role: Option<Role>,
-    pub label: Option<String>,
-    pub max_total_size: Option<u64>,
-    pub max_did_count: Option<u64>,
-}
 
 pub async fn update_acl(
     auth: AdminAuth,

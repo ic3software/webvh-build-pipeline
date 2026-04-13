@@ -3,71 +3,65 @@
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use tracing::info;
-
-use serde::{Deserialize, Serialize};
+use tracing::{info, warn};
 
 use crate::acl::{self, AclEntry};
 use crate::auth::AdminAuth;
 use crate::auth::session::now_epoch;
 use crate::error::AppError;
 use crate::server::AppState;
-use affinidi_webvh_common::server::acl::Role;
-
-#[derive(Serialize)]
-pub struct AclListResponse {
-    pub entries: Vec<AclEntry>,
-}
+use affinidi_webvh_common::server::acl::{
+    AclEntryResponse, AclListResponse, CreateAclRequest, UpdateAclRequest,
+};
 
 // ---------- GET /api/acl ----------
 
 pub async fn list_acl(
-    _auth: AdminAuth,
+    auth: AdminAuth,
     State(state): State<AppState>,
 ) -> Result<Json<AclListResponse>, AppError> {
     let entries = acl::list_acl_entries(&state.acl_ks).await?;
+    let entries = entries.into_iter().map(AclEntryResponse::from).collect();
+    info!(caller = %auth.0.did, "ACL listed");
     Ok(Json(AclListResponse { entries }))
 }
 
 // ---------- POST /api/acl ----------
 
 pub async fn create_acl(
-    _auth: AdminAuth,
+    auth: AdminAuth,
     State(state): State<AppState>,
-    Json(mut entry): Json<AclEntry>,
-) -> Result<(StatusCode, Json<AclEntry>), AppError> {
+    Json(req): Json<CreateAclRequest>,
+) -> Result<(StatusCode, Json<AclEntryResponse>), AppError> {
     // Check if entry already exists
-    if acl::get_acl_entry(&state.acl_ks, &entry.did)
-        .await?
-        .is_some()
-    {
+    if acl::get_acl_entry(&state.acl_ks, &req.did).await?.is_some() {
+        warn!(caller = %auth.0.did, target_did = %req.did, "ACL create rejected: entry already exists");
         return Err(AppError::Conflict(format!(
             "ACL entry already exists for {}",
-            entry.did
+            req.did
         )));
     }
-    entry.created_at = now_epoch();
+    let entry = AclEntry {
+        did: req.did,
+        role: req.role,
+        label: req.label,
+        created_at: now_epoch(),
+        max_total_size: req.max_total_size,
+        max_did_count: req.max_did_count,
+    };
     acl::store_acl_entry(&state.acl_ks, &entry).await?;
-    info!(did = %entry.did, role = %entry.role, "ACL entry created");
-    Ok((StatusCode::CREATED, Json(entry)))
+    info!(caller = %auth.0.did, did = %entry.did, role = %entry.role, "ACL entry created");
+    Ok((StatusCode::CREATED, Json(AclEntryResponse::from(entry))))
 }
 
 // ---------- PUT /api/acl/{did} ----------
 
-#[derive(Deserialize)]
-pub struct UpdateAclRequest {
-    pub role: Option<Role>,
-    pub label: Option<String>,
-    pub max_total_size: Option<u64>,
-    pub max_did_count: Option<u64>,
-}
-
 pub async fn update_acl(
-    _auth: AdminAuth,
+    auth: AdminAuth,
     State(state): State<AppState>,
     Path(did): Path<String>,
     Json(updates): Json<UpdateAclRequest>,
-) -> Result<Json<AclEntry>, AppError> {
+) -> Result<Json<AclEntryResponse>, AppError> {
     let mut entry = acl::get_acl_entry(&state.acl_ks, &did)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("ACL entry not found: {did}")))?;
@@ -86,18 +80,31 @@ pub async fn update_acl(
     }
 
     acl::store_acl_entry(&state.acl_ks, &entry).await?;
-    info!(did = %entry.did, role = %entry.role, "ACL entry updated");
-    Ok(Json(entry))
+    info!(caller = %auth.0.did, did = %entry.did, role = %entry.role, "ACL entry updated");
+    Ok(Json(AclEntryResponse::from(entry)))
 }
 
 // ---------- DELETE /api/acl/{did} ----------
 
 pub async fn delete_acl(
-    _auth: AdminAuth,
+    auth: AdminAuth,
     State(state): State<AppState>,
     Path(did): Path<String>,
 ) -> Result<StatusCode, AppError> {
+    // Prevent self-deletion
+    if auth.0.did == did {
+        warn!(caller = %auth.0.did, "ACL delete rejected: attempted self-deletion");
+        return Err(AppError::Conflict(
+            "cannot delete your own ACL entry".into(),
+        ));
+    }
+
+    // Verify entry exists
+    acl::get_acl_entry(&state.acl_ks, &did)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("ACL entry not found: {did}")))?;
+
     acl::delete_acl_entry(&state.acl_ks, &did).await?;
-    info!(did = %did, "ACL entry deleted");
+    info!(caller = %auth.0.did, did = %did, "ACL entry deleted");
     Ok(StatusCode::NO_CONTENT)
 }
