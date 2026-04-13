@@ -154,6 +154,11 @@ async fn run_daemon(config_path: Option<std::path::PathBuf>) {
             std::process::exit(1);
         });
 
+    // Shared stats collector — used by both server (DID resolves) and control
+    // plane (aggregation + API) so resolve counts are visible in the dashboard.
+    let stats_collector =
+        Arc::new(affinidi_webvh_common::server::stats_collector::StatsCollector::new());
+
     // Build each enabled service's router
     let mut combined: Router = Router::new();
     let mut server_state: Option<affinidi_webvh_server::server::AppState> = None;
@@ -164,7 +169,7 @@ async fn run_daemon(config_path: Option<std::path::PathBuf>) {
     // 1. Server — public DID-serving routes only (.well-known).
     //    All /api management routes come from the control plane.
     if config.enable.server {
-        match build_server(&config, &secrets, &main_store).await {
+        match build_server(&config, &secrets, &main_store, &stats_collector).await {
             Ok((router, state)) => {
                 combined = combined.merge(router);
                 server_state = Some(state);
@@ -209,7 +214,7 @@ async fn run_daemon(config_path: Option<std::path::PathBuf>) {
     //    URLs like /enroll and /api/... work identically in daemon and
     //    standalone modes.
     if config.enable.control {
-        match build_control(&config, &secrets, &main_store).await {
+        match build_control(&config, &secrets, &main_store, &stats_collector).await {
             Ok(router) => {
                 combined = combined.merge(router);
                 enabled_services.push("control (/)");
@@ -307,6 +312,7 @@ async fn build_server(
     config: &DaemonConfig,
     secrets: &ServerSecrets,
     store: &affinidi_webvh_common::server::store::Store,
+    stats_collector: &Arc<affinidi_webvh_common::server::stats_collector::StatsCollector>,
 ) -> Result<(Router, affinidi_webvh_server::server::AppState), AppError> {
     use affinidi_webvh_server::server::AppState;
 
@@ -331,7 +337,7 @@ async fn build_server(
         jwt_keys,
         signing_key_bytes,
         http_client: reqwest::Client::new(),
-        stats_collector: None,
+        stats_collector: Some(stats_collector.clone()),
         did_cache: std::sync::Arc::new(affinidi_webvh_server::cache::ContentCache::new(
             std::time::Duration::from_secs(300),
         )),
@@ -406,6 +412,7 @@ async fn build_control(
     config: &DaemonConfig,
     secrets: &ServerSecrets,
     store: &affinidi_webvh_common::server::store::Store,
+    stats_collector: &Arc<affinidi_webvh_common::server::stats_collector::StatsCollector>,
 ) -> ServiceResult {
     use affinidi_webvh_control::server::AppState;
 
@@ -448,11 +455,7 @@ async fn build_control(
         http_client: reqwest::Client::new(),
         atm: None,
         atm_profile: None,
-        stats_collector: {
-            let collector = affinidi_webvh_common::server::stats_collector::StatsCollector::new();
-            // Daemon mode: basic init, no seeding from store
-            std::sync::Arc::new(collector)
-        },
+        stats_collector: stats_collector.clone(),
         stats_ks: store
             .keyspace("stats")
             .expect("failed to open stats keyspace"),
