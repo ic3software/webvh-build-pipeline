@@ -7,7 +7,7 @@ use affinidi_messaging_didcomm_service::{
 };
 use affinidi_tdk::secrets_resolver::ThreadedSecretsResolver;
 use affinidi_webvh_common::server::auth::extractor::AuthState;
-use affinidi_webvh_common::server::didcomm_profile::build_tdk_profile;
+use affinidi_webvh_common::server::didcomm_profile::{build_tdk_profile, wait_for_did_resolution};
 use affinidi_webvh_common::server::init;
 use affinidi_webvh_common::server::passkey::PasskeyState;
 use tokio_util::sync::CancellationToken;
@@ -178,7 +178,14 @@ pub async fn run(config: AppConfig, store: Store, secrets: ServerSecrets) -> Res
         secrets_resolver,
         jwt_keys,
         webauthn,
-        http_client: reqwest::Client::new(),
+        // Disable redirect-following: combined with the proxy's
+        // Authorization-header passthrough, an attacker-registered backend
+        // URL must not be able to redirect the proxy onto a third-party host
+        // and harvest the forwarded JWT.
+        http_client: reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("reqwest client construction must succeed"),
         didcomm_service: Arc::new(std::sync::OnceLock::new()),
         stats_collector: {
             use affinidi_webvh_common::server::stats_collector::{StatsAggregate, StatsCollector};
@@ -421,6 +428,15 @@ pub async fn start_didcomm_service(
         mediator_did = mediator_did,
         "building TDK profile for DIDComm"
     );
+
+    // Block until the mediator DID document is resolvable. On a cold start
+    // the mediator DID may be hosted by a webvh-server that has not yet
+    // published its log, so we retry instead of starting the listener
+    // against an unreachable mediator (which surfaces as a cryptic
+    // "No Mediator is configured for this Profile" later).
+    if let Some(resolver) = state.did_resolver.as_ref() {
+        wait_for_did_resolution(mediator_did, "mediator", resolver, &shutdown).await?;
+    }
 
     let profile = build_tdk_profile(
         "control",

@@ -53,8 +53,8 @@ Standalone mode:                          Daemon mode:
 
 ### Requirements
 
-- Rust 1.91.0+ (2024 Edition)
-- Node.js 18+ (only if building the management UI)
+- Rust 1.94.0+ (2024 Edition)
+- Node.js 20+ (only if building the management UI)
 
 ### Option 1: Unified daemon (recommended for getting started)
 
@@ -66,6 +66,11 @@ cd affinidi-webvh-service
 cargo build -p affinidi-webvh-daemon --release
 ./target/release/webvh-daemon
 ```
+
+The daemon supports two identity modes at setup time:
+
+- **VTA-managed** (default) — a parent VTA provisions the daemon's keys and DID. Requires VTA credentials.
+- **Self-managed** — the daemon generates its own keys and self-hosts a `did:webvh` identifier. No VTA required. Daemon-only. See [docs/bootstrap_startup.md](docs/bootstrap_startup.md#self-managed-mode-no-vta--daemon-only).
 
 See [webvh-daemon/README.md](webvh-daemon/) for configuration details.
 
@@ -104,10 +109,15 @@ cargo build -p affinidi-webvh-server --example client
 
 1. Start the webvh-server with DIDComm authentication configured.
 
-2. Run the example, pointing it at the server:
+2. Run the example, pointing it at the server. `--webvh-did` is the
+   service's own DID — it's printed by `webvh-server setup` and
+   `webvh-daemon setup` on completion. Re-print it any time with
+   `webvh-server show-did` (or `webvh-daemon show-did`):
 
    ```sh
-   cargo run -p affinidi-webvh-server --example client -- --server-url http://localhost:8530
+   cargo run -p affinidi-webvh-server --example client -- \
+     --server-url http://localhost:8530 \
+     --webvh-did did:webvh:...:localhost%3A8530:server
    ```
 
 3. The example will generate a `did:key` identity and pause, printing the DID:

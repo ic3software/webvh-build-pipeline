@@ -1,6 +1,244 @@
 # Changelog
 
-## [Unreleased]
+## 0.6.0 (2026-05-05)
+
+### Security
+
+- **All three refresh handlers (control, server, witness) now require a
+  JWS-signed DIDComm envelope and bind the signer to the session DID.**
+  webvh-control was the last hold-out — it accepted a raw refresh-token
+  string in the body. Refresh now requires possession of both the refresh
+  token *and* the session-DID's signing key on every service.
+- **Offline-bootstrap latent-bug fix.** `open_offline_bootstrap_response`
+  used `BTreeMap::iter().next()` to pick "the" DidKeyMaterial entry from
+  the sealed payload's secrets map. With admin rollover enabled (the
+  production-recommended VTA config), payloads carry two entries —
+  integration and admin — and the alphabetical iteration order silently
+  picked the wrong one (`did:key:...` admin sorts before `did:webvh:...`
+  integration). The open path now matches by `config.did_document.id`
+  with a logged forward-compat fallback. New
+  `offline_bootstrap_full_webvh_to_vta_roundtrip` integration test
+  exercises the full webvh ↔ VTA seal/open path in-process and would
+  have caught this regression before publish.
+- **Refresh-token rotation TOCTOU closed end-to-end.** Two concurrent
+  requests with the same leaked refresh token used to both pass the
+  lookup before either deleted the session. The fix is a new
+  `KeyspaceOps::take_raw_atomic` primitive — Redis `GETDEL` /
+  DynamoDB `DeleteItem` with `ReturnValues=ALL_OLD` / fjall mutex /
+  per-keyspace mutex on Firestore + Cosmos DB. All three refresh
+  handlers (control, server, witness) now atomically consume the
+  refresh-index entry as part of the lookup, so exactly one concurrent
+  caller wins — even across multiple webvh replicas backed by Redis
+  or DynamoDB. The previous in-process `RefreshClaim` workaround is
+  removed.
+- **Refresh handlers (server, witness) now bind the JWS signer to the session
+  DID.** Previously a leaked refresh token plus any attacker-controlled DID
+  could rotate the victim's tokens — the signed envelope only proved
+  possession of *some* key. Both handlers now reject when the verified
+  signer DID does not equal `session.did`.
+- **Empty-`jti` rotation bypass closed.** The extractor used to short-circuit
+  the rotation check when `claims.jti.is_empty()`. Any session with a
+  `token_id` now requires a non-empty matching `jti`, regardless of how
+  the token was minted.
+- **Registry / proxy trust chain hardened in webvh-control.** The audit
+  found a Service-role JWT could register an attacker URL as a backend
+  instance, and the proxy would then forward an Admin caller's
+  Authorization header to it on the next proxy hit:
+  - `RegistryConfig` gains an optional `url_allowlist` for backend hostnames.
+  - `webvh-control`'s reqwest client is built with `Policy::none()` so
+    a malicious backend cannot redirect the proxy onto a third-party host.
+  - The proxy strips RFC 7230 §6.1 hop-by-hop headers and `Set-Cookie`
+    from upstream responses before forwarding.
+- **Watcher `/api/sync/did` body limited to 4 MiB** via a tower-http
+  `RequestBodyLimitLayer`, and `validate_did_jsonl` now requires the
+  latest entry's `state.id` to start with `did:webvh:`. Closes a leaked-
+  push-token DoS / arbitrary-content republish vector.
+- **Manual `Debug` redaction extended** to `Session` (refresh_token,
+  token_id, challenge), `Enrollment` (invite token), `StoredSecrets`
+  (bootstrap_seed), and `SecretsConfig` (plaintext_bootstrap_seed).
+- **Multi-signature JWS envelopes are rejected** by `unpack_signed`. The
+  threat model assumes single-signer messages; accepting additional
+  signatures silently created surprising states.
+- **X25519 verification methods rejected** by `resolve_verifying_key` —
+  Ed25519 signing keys and X25519 key-agreement keys are both 32 bytes,
+  so the previous length check would not catch a kid pointing at the
+  wrong key class.
+- **Keyring init no longer poisons the process** on transient failures.
+  Only the success case is cached; transient failures (dbus not yet up,
+  etc.) are allowed to retry on the next constructor call.
+- **`write_secret_file_0600` is now atomic-rename safe** — uses a
+  sibling tempfile with mode 0600 set before data is written, then
+  rename. Re-runs of the offline-bootstrap CLI no longer fail with
+  EEXIST when the seed file already exists.
+- **DIDComm authentication closed an auth-bypass on every REST `/api/auth/`
+  endpoint.** `unpack_signed` now returns the JWS-verified signer DID and
+  rejects envelopes whose `from` field disagrees. Previously an attacker
+  controlling any DID could mint a JWT for any ACL'd DID on the server,
+  control plane, or witness REST surface. The mediator-driven inbound DIDComm
+  path was unaffected.
+- **Stats-sync endpoint requires Service-role auth** and binds the payload's
+  `server_did` to the JWT-authenticated caller. Closes a counter-poisoning
+  vector on the public control-plane surface.
+- **Watcher sync now runs `validate_did_jsonl`** before storing pushed log
+  content. A leaked push token can no longer republish arbitrary JSON
+  masquerading as a DID document.
+- **Witness `sign_proof` is now Admin-only** and emits an audit log on every
+  signed proof. Previously any authenticated caller could request a witness
+  proof for any version_id.
+- **Reverse proxy in webvh-control requires Admin role** rather than any
+  authenticated user.
+- **Refresh handlers rotate everything.** The control / server / witness
+  refresh endpoints now mint a fresh `session_id`, access token and refresh
+  token on every refresh; the old session is deleted atomically. The
+  `RefreshData` response shape gains `refresh_token` + `refresh_expires_at`
+  so callers can drive the next refresh.
+- **Private key files are written atomically** with mode 0600 using
+  `OpenOptions::create_new`. Closes a TOCTOU window between `fs::write` and
+  `set_permissions`.
+- **`ServerSecrets`, `WitnessRecord`, `PlaintextSecrets` redact `Debug`** so
+  `tracing::debug!(?secrets, …)` no longer leaks key material.
+- **`PlaintextSecretStore::set` now persists `vta_credential`** instead of
+  silently dropping it. Plaintext-backed deployments could previously lose
+  their VTA credential on any wizard-driven config rewrite.
+- **HTTP responses carry CSP, Referrer-Policy, HSTS** in addition to the
+  existing X-Frame-Options / X-Content-Type-Options / Cache-Control.
+- **Invite tokens** are now logged as a token-prefix only (revoke / update
+  handlers in the passkey module). The token itself is no longer committed
+  to operator log streams.
+- **`KeyringSecretStore::try_new`** surfaces backend-registration failure as
+  a structured `AppError::SecretStore` instead of warning-then-mystery-error.
+
+### Added
+- **webvh-daemon**: Self-managed identity mode. The setup wizard now
+  offers a fourth choice ("Self-managed — no VTA — daemon manages its
+  own DID") that skips every VTA prompt and instead generates the
+  daemon's Ed25519 + X25519 keys locally and self-hosts a `did:webvh`
+  identifier. Config gains an `[identity] mode = "vta" | "self-managed"`
+  field (default `"vta"` for back-compat — existing configs without
+  the section continue to load unchanged). Admin enrolment in
+  self-managed mode uses passkey-invite only via the existing
+  `webvh-daemon invite --did <DID> --role admin` CLI; the wizard does
+  not seed any admin DID into the ACL. Tenant DID provisioning over
+  DIDComm is unchanged — external tenant VTAs can still provision
+  DIDs into a self-managed daemon. Daemon-only in v1; standalone
+  `webvh-server` / `webvh-control` / `webvh-witness` setup wizards
+  reject the self-managed choice with a clear "daemon-only" error
+  pointing at `webvh-daemon`. See `docs/self-managed-mode-spec.md`.
+- **webvh-control**: Web UI for creating enrollment invites. The Access
+  Control page now has an "Invite by Link" card that generates an
+  enrollment URL for a given DID and role, removing the need to drop to
+  the `webvh-control invite` CLI to onboard new users. The invitee opens
+  the link, registers a passkey, and is added to the ACL automatically.
+
+### Fixed
+- **Offline-bootstrap phase 2 fails with "bootstrap seed missing from
+  secret store" in plaintext mode.** Phase 1 wrote the seed to
+  `[secrets].plaintext_bootstrap_seed` in `config.toml` and serialised
+  the wizard's `SecretsConfig` snapshot — captured *before* the seed was
+  written — into `setup-offline-state.toml`. Phase 2 reconstructed the
+  store from that stale snapshot and reported the seed missing even
+  though it was sitting on disk. Affected all four wizards (daemon,
+  control, server, witness) when built without a secure secrets backend
+  (no `keyring` / `aws-secrets` / `gcp-secrets` / `azure-secrets`
+  feature). `PlaintextSecretStore::get_bootstrap_seed` now reads
+  directly from the config file rather than caching at construction;
+  the file is the source of truth, matching how the cloud and keyring
+  backends already worked. Regression tests cover the wizard's exact
+  serialise-snapshot-then-reload flow plus the malformed-seed
+  operator-edit case.
+- **Setup wizards**: the offline-bootstrap "Next steps" output printed
+  an incorrect VTA-host CLI hint
+  (`vta context provision --context X --admin Y`). The actual command
+  is `vta context create --id X` with no `--admin` flag. Updated all
+  five wizards (common, server, control, witness, daemon).
+
+### Changed
+- **Keyring backend**: migrated from the `keyring` 3.x facade crate to
+  `keyring-core` 1.x with platform-specific backend stores
+  (`apple-native-keyring-store`, `windows-native-keyring-store`,
+  `dbus-secret-service-keyring-store`) selected by target cfg. The
+  default credential store is registered once at first
+  `KeyringSecretStore::new()` call. No on-disk format changes — entries
+  written by the previous build are still readable.
+- **vta-sdk integration**: adapted to upstream `ProvisionAsk` builder
+  renames — `webvh_hosting_server` → `webvh_daemon`, `webvh_service`
+  → `webvh_server` for witness-style consumers, and a new
+  `webvh_control(context, host_url, mediator_did)` builder for the
+  control plane (now requires `host_url` since the upstream template
+  embeds it as the `WebVHHosting` service endpoint). The control-plane
+  wizard now collects `did_hosting_url` before the VTA round-trip.
+- **webvh-ui**: Login page "need access?" section no longer surfaces the
+  CLI command — it now instructs users to request an invite link from an
+  admin, matching the new web-based flow.
+- **MSRV**: raised from 1.91.0 to 1.94.0. Required by the updated
+  affinidi-tdk / affinidi-messaging / affinidi-secrets-resolver /
+  affinidi-data-integrity stacks, all of which declared 1.94+ in their
+  latest releases.
+- **Witness proof signing**: migrated to the new async `Signer`-based API
+  in affinidi-data-integrity 0.6. The `WitnessSigner` trait is now async
+  (returns a `BoxFuture`) — any external signer implementations must be
+  updated accordingly.
+- **CosmosDB store**: migrated to azure_data_cosmos's required
+  `RoutingStrategy` parameter and the now-async `container_client()`.
+  Region is configurable via new `store.cosmosdb_region` setting (env:
+  `*_STORE_COSMOSDB_REGION`), accepting any Azure region name — display
+  form (`"West US 2"`) or normalized (`"westus2"`). Defaults to
+  `"eastus"` when unset.
+
+### Tests
+- **DIDComm dispatcher coverage** in `webvh-control`. Added 22 unit tests
+  exercising the wire-level contract: every `dispatch_did_op` arm
+  (validation, success, conflict, not-found, cross-owner forbidden), the
+  authenticate flow end-to-end with JWT decode-back assertions, and the
+  ACL gate at the dispatcher level. Refactored `handle_authenticate` and
+  `handle_webvh_message` to delegate to `(String, Value)`-returning
+  helpers (`run_authenticate`, `run_webvh_dispatch`) so the wire-level
+  responses are testable without an `ATM`-backed `HandlerContext`. Also
+  added `affinidi-messaging-test-mediator` (0.2) as a dev-dep for
+  in-process embedded mediator tests. Smoke tests validate the
+  fixture spawns, provisions distinct DIDs via the new
+  `TestMediator::with_users` helper, and supports incremental
+  `TestMediatorHandle::add_user` post-spawn — the lighter-weight
+  alternative to `TestEnvironment` for handler-level scenarios that
+  don't need an ATM-bound profile.
+- **JWT crypto provider unification fix.** `JwtKeys::from_ed25519_bytes`
+  now idempotently installs `jsonwebtoken::crypto::rust_crypto` as the
+  process-level provider before encode/decode. Required because
+  workspace-feature unification (e.g. when a dev-dep transitively pulls
+  in `aws_lc_rs`) made `jsonwebtoken` 10.x refuse to auto-pick a
+  provider and panic on first use. The install is a no-op on subsequent
+  calls so it's safe across any thread.
+
+### Build
+- **UI build now requires Node.js 20+.** Metro/Expo's loader uses
+  `Array.prototype.toReversed()`, which landed in Node 20 — older
+  toolchains fail deep inside `expo export` with
+  `TypeError: configs.toReversed is not a function`.
+  `webvh-control/build.rs` now preflights `node --version` and fails
+  with an actionable message when Node is missing or too old.
+  `webvh-ui/package.json` also declares `engines.node >= 20`. README
+  prerequisites updated from Node 18+ to Node 20+.
+
+### Dependencies
+- affinidi-tdk 0.5 → 0.7
+- affinidi-tdk-common 0.4 → 0.6
+- affinidi-messaging-didcomm 0.13.1 → 0.13.2
+- affinidi-messaging-didcomm-service 0.2 → 0.3
+- affinidi-messaging-sdk 0.16 → 0.17
+- affinidi-secrets-resolver 0.5.3 → 0.5.5
+- affinidi-did-resolver-cache-sdk 0.8.4 → 0.8.6
+- affinidi-data-integrity 0.3 → 0.6 (breaking API — see note above)
+- vta-sdk 0.4 → 0.5 (template-driven provisioning)
+- didwebvh-rs 0.4 → 0.5 (transitive)
+- firestore 0.47 → 0.48
+- azure_core 0.32 → 0.35
+- azure_data_cosmos 0.31 → 0.33 (breaking API)
+- azure_security_keyvault_secrets 0.13 → 0.14
+- azure_identity 0.34 → 0.35
+- redis 1.0 → 1.2 (breaking `AsyncIter::next_item` now returns
+  `Option<RedisResult<T>>`)
+- aws-sdk-* and aws-config patch bumps
+- keyring 3 → keyring-core 1 (see Changed)
 
 ## 0.5.0 (2026-04-13)
 

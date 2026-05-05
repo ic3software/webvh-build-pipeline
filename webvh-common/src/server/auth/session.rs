@@ -16,7 +16,7 @@ pub enum SessionState {
 }
 
 /// A session record stored under `session:{session_id}`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Session {
     pub session_id: String,
     pub did: String,
@@ -29,6 +29,28 @@ pub struct Session {
     /// each token issue/refresh so old tokens are immediately invalidated.
     #[serde(default)]
     pub token_id: Option<String>,
+}
+
+// Manual `Debug` redacts the secret fields (challenge, refresh_token, token_id)
+// so a casual `tracing::debug!(?session, …)` does not leak material a leak-
+// detector would flag. Non-secret fields (session_id, did, state, timestamps)
+// stay visible for diagnostics.
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Session")
+            .field("session_id", &self.session_id)
+            .field("did", &self.did)
+            .field("challenge", &"<redacted>")
+            .field("state", &self.state)
+            .field("created_at", &self.created_at)
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("refresh_expires_at", &self.refresh_expires_at)
+            .field("token_id", &self.token_id.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 fn session_key(session_id: &str) -> String {
@@ -73,6 +95,32 @@ pub async fn get_session_by_refresh(
     token: &str,
 ) -> Result<Option<String>, AppError> {
     match sessions.get_raw(refresh_key(token)).await? {
+        Some(bytes) => {
+            let session_id = String::from_utf8(bytes)
+                .map_err(|e| AppError::Internal(format!("invalid session_id bytes: {e}")))?;
+            Ok(Some(session_id))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Atomically look up *and consume* the refresh-token → session_id index.
+///
+/// Backed by `KeyspaceHandle::take_raw` (`Redis GETDEL` / DynamoDB
+/// `DeleteItem`+`ReturnValues=ALL_OLD` / fjall mutex). Exactly one
+/// concurrent caller observes `Some` for any given refresh token, even
+/// across replicas backed by Redis or DynamoDB.
+///
+/// This is the cross-replica equivalent of the in-process `RefreshClaim`
+/// added in an earlier round, and replaces it on the rotation path: the
+/// caller that wins the take is the only one that proceeds to delete the
+/// session and create a new one. Losers see `Ok(None)` and reject the
+/// refresh as already consumed.
+pub async fn take_session_id_by_refresh(
+    sessions: &KeyspaceHandle,
+    token: &str,
+) -> Result<Option<String>, AppError> {
+    match sessions.take_raw(refresh_key(token)).await? {
         Some(bytes) => {
             let session_id = String::from_utf8(bytes)
                 .map_err(|e| AppError::Internal(format!("invalid session_id bytes: {e}")))?;

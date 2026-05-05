@@ -1,7 +1,7 @@
 [package]
 name = "affinidi-webvh-witness"
 description = "WebVH Witness Node. Approves and generates proofs for DID Changes"
-version = "0.4.0"
+version = "0.6.0"
 edition.workspace = true
 authors.workspace = true
 readme = "README.md"
@@ -18,6 +18,7 @@ default = ["keyring", "store-fjall"]
 keyring = ["affinidi-webvh-common/keyring"]
 aws-secrets = ["affinidi-webvh-common/aws-secrets"]
 gcp-secrets = ["affinidi-webvh-common/gcp-secrets"]
+azure-secrets = ["affinidi-webvh-common/azure-secrets"]
 store-fjall = ["affinidi-webvh-common/store-fjall"]
 store-redis = ["affinidi-webvh-common/store-redis"]
 store-dynamodb = ["affinidi-webvh-common/store-dynamodb"]
@@ -33,7 +34,7 @@ name = "webvh-witness"
 path = "src/main.rs"
 
 [dependencies]
-affinidi-webvh-common = { path = "../webvh-common", features = ["server-core"] }
+affinidi-webvh-common = { version = "0.6", path = "../webvh-common", features = ["server-core", "setup-wizard"] }
 affinidi-tdk = { workspace = true }
 affinidi-messaging-didcomm-service = { workspace = true }
 affinidi-tdk-common = { workspace = true }
@@ -41,7 +42,7 @@ affinidi-messaging-didcomm = { workspace = true }
 affinidi-secrets-resolver = { workspace = true }
 tokio-util = { workspace = true }
 affinidi-did-resolver-cache-sdk = { workspace = true }
-affinidi-data-integrity = "0.3"
+affinidi-data-integrity = "0.6"
 didwebvh-rs = { workspace = true }
 axum = "0.8"
 axum-extra = { workspace = true }

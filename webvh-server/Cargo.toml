@@ -1,7 +1,7 @@
 [package]
 name = "affinidi-webvh-server"
 description = "WebVH Server, handles management and serving of WebVH Content"
-version = "0.5.0"
+version = "0.6.0"
 edition.workspace = true
 authors.workspace = true
 readme = "README.md"
@@ -16,13 +16,20 @@ build = "build.rs"
 [features]
 default = ["keyring", "store-fjall"]
 metrics = ["affinidi-webvh-common/metrics"]
-keyring = ["dep:keyring", "affinidi-webvh-common/keyring"]
+keyring = ["affinidi-webvh-common/keyring"]
 aws-secrets = ["dep:aws-sdk-secretsmanager", "dep:aws-config", "affinidi-webvh-common/aws-secrets"]
 gcp-secrets = [
   "dep:google-cloud-secretmanager-v1",
   "dep:google-cloud-auth",
   "dep:bytes",
   "affinidi-webvh-common/gcp-secrets",
+]
+azure-secrets = [
+  "dep:azure_security_keyvault_secrets",
+  "dep:azure_identity",
+  "dep:azure_core",
+  "dep:futures",
+  "affinidi-webvh-common/azure-secrets",
 ]
 store-fjall = ["dep:fjall"]
 store-redis = ["dep:redis", "affinidi-webvh-common/store-redis"]
@@ -39,7 +46,7 @@ name = "webvh-server"
 path = "src/main.rs"
 
 [dependencies]
-affinidi-webvh-common = { path = "../webvh-common", features = ["server-core", "store-fjall"] }
+affinidi-webvh-common = { version = "0.6", path = "../webvh-common", features = ["server-core", "store-fjall", "setup-wizard"] }
 affinidi-tdk = { workspace = true }
 affinidi-messaging-didcomm-service = { workspace = true }
 affinidi-tdk-common = { workspace = true }
@@ -72,7 +79,6 @@ tower-http = { version = "0.6", features = ["trace"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
-keyring = { version = "3", optional = true }
 aws-sdk-secretsmanager = { version = "1", optional = true }
 aws-config = { version = "1", features = [
   "behavior-version-latest",
@@ -82,12 +88,14 @@ google-cloud-auth = { version = "1", optional = true }
 bytes = { version = "1", optional = true }
 redis = { version = "1.0", features = ["tokio-comp", "aio"], optional = true }
 aws-sdk-dynamodb = { version = "1", optional = true }
-firestore = { version = "0.47", optional = true }
+firestore = { version = "0.48", optional = true }
 futures = { version = "0.3", optional = true }
-azure_data_cosmos = { version = "0.31", features = [
+azure_data_cosmos = { version = "0.33", features = [
   "key_auth",
 ], optional = true }
-azure_core = { version = "0.32", optional = true }
+azure_core = { version = "0.35", optional = true }
+azure_security_keyvault_secrets = { version = "0.14", optional = true }
+azure_identity = { version = "0.35", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
@@ -97,3 +105,4 @@ http-body-util = "0.1"
 ratatui = "0.30"
 crossterm = "0.29"
 reqwest = { workspace = true }
+sysinfo = { version = "0.38", default-features = false, features = ["system"] }

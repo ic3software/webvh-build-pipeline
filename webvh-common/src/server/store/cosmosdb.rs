@@ -1,10 +1,13 @@
 use std::sync::Arc;
 
-use azure_data_cosmos::{CosmosAccountEndpoint, CosmosAccountReference, CosmosClient};
+use azure_data_cosmos::{
+    CosmosAccountEndpoint, CosmosAccountReference, CosmosClient, Region, RoutingStrategy,
+};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
 use tracing::info;
 
 use crate::server::config::StoreConfig;
@@ -87,8 +90,16 @@ impl CosmosDbBackend {
             azure_core::credentials::Secret::new(account_key),
         );
 
+        // Cosmos DB 0.32 requires explicit routing. Accept any Azure region
+        // name (display or normalized form); default to EAST_US when unset.
+        let region = config
+            .cosmosdb_region
+            .as_deref()
+            .map(|name| Region::new(name.to_string()))
+            .unwrap_or(Region::EAST_US);
+
         let client = CosmosClient::builder()
-            .build(account)
+            .build(account, RoutingStrategy::ProximityTo(region))
             .await
             .map_err(|e| AppError::Store(format!("cosmosdb build client: {e}")))?;
 
@@ -104,6 +115,7 @@ impl StorageBackend for CosmosDbBackend {
                 client: self.client.clone(),
                 database: self.database.clone(),
                 container_name: name.to_string(),
+                take_lock: Mutex::new(()),
             }),
         ))
     }
@@ -130,6 +142,9 @@ struct CosmosDbKeyspace {
     client: CosmosClient,
     database: String,
     container_name: String,
+    /// Per-keyspace mutex for `take_raw_atomic` — see method doc for the
+    /// single-replica-only caveat.
+    take_lock: Mutex<()>,
 }
 
 fn encode_doc_id(key: &[u8]) -> String {
@@ -137,25 +152,27 @@ fn encode_doc_id(key: &[u8]) -> String {
 }
 
 impl CosmosDbKeyspace {
-    async fn container(&self) -> azure_data_cosmos::clients::ContainerClient {
+    async fn container(&self) -> Result<azure_data_cosmos::clients::ContainerClient, AppError> {
         self.client
             .database_client(&self.database)
             .container_client(&self.container_name)
             .await
+            .map_err(|e| AppError::Store(format!("cosmosdb container client: {e}")))
     }
 }
 
 impl KeyspaceOps for CosmosDbKeyspace {
     fn insert_raw(&self, key: Vec<u8>, value: Vec<u8>) -> BoxFuture<'_, Result<(), AppError>> {
         Box::pin(async move {
-            let container = self.container().await;
+            let container = self.container().await?;
+            let doc_id = encode_doc_id(&key);
             let doc = KvDoc {
-                id: encode_doc_id(&key),
+                id: doc_id.clone(),
                 pk: PARTITION_VALUE.to_string(),
                 data: BASE64.encode(&value),
             };
             container
-                .upsert_item(PARTITION_VALUE, doc, None)
+                .upsert_item(PARTITION_VALUE, &doc_id, doc, None)
                 .await
                 .map_err(|e| AppError::Store(format!("cosmosdb upsert: {e}")))?;
             Ok(())
@@ -164,7 +181,7 @@ impl KeyspaceOps for CosmosDbKeyspace {
 
     fn get_raw(&self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, AppError>> {
         Box::pin(async move {
-            let container = self.container().await;
+            let container = self.container().await?;
             let doc_id = encode_doc_id(&key);
             match container
                 .read_item::<KvDoc>(PARTITION_VALUE, &doc_id, None)
@@ -187,7 +204,7 @@ impl KeyspaceOps for CosmosDbKeyspace {
 
     fn remove(&self, key: Vec<u8>) -> BoxFuture<'_, Result<(), AppError>> {
         Box::pin(async move {
-            let container = self.container().await;
+            let container = self.container().await?;
             let doc_id = encode_doc_id(&key);
             match container.delete_item(PARTITION_VALUE, &doc_id, None).await {
                 Ok(_) => Ok(()),
@@ -199,7 +216,7 @@ impl KeyspaceOps for CosmosDbKeyspace {
 
     fn contains_key(&self, key: Vec<u8>) -> BoxFuture<'_, Result<bool, AppError>> {
         Box::pin(async move {
-            let container = self.container().await;
+            let container = self.container().await?;
             let doc_id = encode_doc_id(&key);
             match container
                 .read_item::<KvDoc>(PARTITION_VALUE, &doc_id, None)
@@ -212,9 +229,30 @@ impl KeyspaceOps for CosmosDbKeyspace {
         })
     }
 
+    fn take_raw_atomic(&self, key: Vec<u8>) -> BoxFuture<'_, Result<Option<Vec<u8>>, AppError>> {
+        // Cosmos DB does not expose a single-call atomic get-and-remove
+        // primitive; transactional batches are container-bounded and
+        // would require a transactional batch with a read followed by
+        // a delete, which is heavyweight for the refresh-token rotation
+        // path. The current implementation serialises the get-then-
+        // remove with a per-keyspace mutex — correct for **single-
+        // replica** webvh deployments backed by Cosmos DB. Multi-replica
+        // deployments wanting refresh-token rotation atomicity should
+        // pick `store-redis` or `store-dynamodb`, or upgrade this to
+        // a transactional batch in a follow-up.
+        Box::pin(async move {
+            let _guard = self.take_lock.lock().await;
+            let value = self.get_raw(key.clone()).await?;
+            if value.is_some() {
+                self.remove(key).await?;
+            }
+            Ok(value)
+        })
+    }
+
     fn prefix_iter_raw(&self, prefix: Vec<u8>) -> BoxFuture<'_, Result<Vec<RawKvPair>, AppError>> {
         Box::pin(async move {
-            let container = self.container().await;
+            let container = self.container().await?;
 
             let query = if prefix.is_empty() {
                 azure_data_cosmos::Query::from("SELECT * FROM c WHERE c.pk = @pk")
@@ -310,17 +348,21 @@ impl BatchOps for CosmosDbBatch {
                     .client
                     .database_client(&self.database)
                     .container_client(container_name)
-                    .await;
+                    .await
+                    .map_err(|e| {
+                        AppError::Store(format!("cosmosdb batch container client: {e}"))
+                    })?;
 
                 match op {
                     CosmosDbBatchOp::Insert { key, value, .. } => {
+                        let doc_id = encode_doc_id(key);
                         let doc = KvDoc {
-                            id: encode_doc_id(key),
+                            id: doc_id.clone(),
                             pk: PARTITION_VALUE.to_string(),
                             data: BASE64.encode(value),
                         };
                         container_client
-                            .upsert_item(PARTITION_VALUE, doc, None)
+                            .upsert_item(PARTITION_VALUE, &doc_id, doc, None)
                             .await
                             .map_err(|e| AppError::Store(format!("cosmosdb batch upsert: {e}")))?;
                     }

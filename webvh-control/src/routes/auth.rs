@@ -78,8 +78,8 @@ pub async fn authenticate(
 
     let (did_resolver, _secrets_resolver, jwt_keys) = state.require_didcomm_auth()?;
 
-    // Unpack the signed DIDComm message
-    let (msg, _signer_kid) = didcomm_unpack::unpack_signed(&body, did_resolver).await?;
+    // Unpack the signed DIDComm message; sender_base is the JWS-verified DID.
+    let (msg, sender_base) = didcomm_unpack::unpack_signed(&body, did_resolver).await?;
 
     // Validate message type
     if msg.typ != "https://affinidi.com/webvh/1.0/authenticate" {
@@ -124,13 +124,7 @@ pub async fn authenticate(
         return Err(AppError::Authentication("challenge expired".into()));
     }
 
-    // Verify sender DID matches session DID (compare base DID without fragment)
-    let sender_did = msg
-        .from
-        .as_deref()
-        .ok_or_else(|| AppError::Authentication("missing sender DID".into()))?;
-    let sender_base = sender_did.split('#').next().unwrap_or(sender_did);
-
+    // sender_base is the JWS-verified DID (unpack_signed enforced from == signer).
     if sender_base != session.did {
         warn!(
             expected = %session.did,
@@ -172,20 +166,57 @@ pub async fn refresh(
     State(state): State<AppState>,
     body: String,
 ) -> Result<Json<affinidi_webvh_common::RefreshResponse>, AppError> {
-    let jwt_keys = state
-        .jwt_keys
-        .as_ref()
-        .ok_or_else(|| AppError::Authentication("JWT keys not configured".into()))?;
+    use affinidi_webvh_common::server::didcomm_unpack;
 
-    let refresh_token = body.trim().trim_matches('"');
+    let (did_resolver, _secrets_resolver, jwt_keys) = state.require_didcomm_auth()?;
 
-    let session_id = session::get_session_by_refresh(&state.sessions_ks, refresh_token)
+    // Parity with server/witness: refresh requires a JWS-signed DIDComm
+    // envelope addressed by the holder of the session DID. Proves
+    // possession of the signing key, not just the bearer refresh token,
+    // so a leaked refresh token alone cannot rotate a victim's tokens.
+    let (msg, sender_base) = didcomm_unpack::unpack_signed(&body, did_resolver).await?;
+
+    if msg.typ != "https://affinidi.com/webvh/1.0/authenticate/refresh" {
+        return Err(AppError::Authentication(format!(
+            "unexpected message type: {}",
+            msg.typ
+        )));
+    }
+
+    let refresh_token = msg
+        .body
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AppError::Authentication("missing refresh_token in message body".into()))?;
+
+    // Atomically claim and consume the refresh-token → session_id index in
+    // a single backend operation (Redis GETDEL / DynamoDB DeleteItem with
+    // ReturnValues=ALL_OLD / fjall mutex). Exactly one concurrent request
+    // with the same token sees `Some` here, even across replicas. Losers
+    // see `None` and reject as if the token were invalid — which it now
+    // is, having been consumed by the winner.
+    let session_id = session::take_session_id_by_refresh(&state.sessions_ks, refresh_token)
         .await?
         .ok_or_else(|| AppError::Authentication("invalid refresh token".into()))?;
 
     let session = session::get_session(&state.sessions_ks, &session_id)
         .await?
         .ok_or_else(|| AppError::Authentication("session not found".into()))?;
+
+    // Bind the JWS signer to the session DID. Same invariant as server/witness:
+    // signing proves possession of the right key for *this* session, not just
+    // some key for some DID.
+    if sender_base != session.did {
+        warn!(
+            session_id = %session.session_id,
+            session_did = %session.did,
+            sender = %sender_base,
+            "refresh rejected: signer DID does not match session DID",
+        );
+        return Err(AppError::Authentication(
+            "signer DID does not match session DID".into(),
+        ));
+    }
 
     // Verify session is in Authenticated state
     if session.state != SessionState::Authenticated {
@@ -201,26 +232,32 @@ pub async fn refresh(
         return Err(AppError::Authentication("refresh token expired".into()));
     }
 
-    // Invalidate the old session to prevent refresh token reuse
+    // Refresh rotates everything: a brand-new session id, access token, and
+    // refresh token. The old session is deleted atomically so a leaked
+    // refresh token cannot be reused.
     session::delete_session(&state.sessions_ks, &session.session_id).await?;
 
     let role = crate::acl::check_acl(&state.acl_ks, &session.did).await?;
 
-    let claims = crate::auth::jwt::JwtKeys::new_claims(
-        session.did.clone(),
-        session_id.clone(),
-        role.to_string(),
+    let token_response = session::create_authenticated_session(
+        &state.sessions_ks,
+        jwt_keys,
+        &session.did,
+        &role,
         state.config.auth.access_token_expiry,
-    );
-    let access_token = jwt_keys.encode(&claims)?;
+        state.config.auth.refresh_token_expiry,
+    )
+    .await?;
 
     info!(did = %session.did, "token refreshed");
 
     Ok(Json(affinidi_webvh_common::RefreshResponse {
-        session_id,
+        session_id: token_response.session_id,
         data: affinidi_webvh_common::RefreshData {
-            access_token,
-            access_expires_at: claims.exp,
+            access_token: token_response.access_token,
+            access_expires_at: token_response.access_expires_at,
+            refresh_token: token_response.refresh_token,
+            refresh_expires_at: token_response.refresh_expires_at,
         },
     }))
 }

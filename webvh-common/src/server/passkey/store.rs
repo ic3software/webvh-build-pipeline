@@ -10,13 +10,29 @@ use crate::server::store::KeyspaceHandle;
 // ---------------------------------------------------------------------------
 
 /// One-time enrollment invitation created by the CLI `invite` subcommand.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct Enrollment {
     pub token: String,
     pub did: String,
     pub role: String,
     pub created_at: u64,
     pub expires_at: u64,
+}
+
+// Manual `Debug` keeps the diagnostic fields visible while redacting the
+// invite token. The token is the bearer credential — leaking it via a stray
+// `tracing::debug!(?enrollment, …)` is exactly the regression class the
+// rest of the workspace's manual-Debug pattern is set up to prevent.
+impl std::fmt::Debug for Enrollment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Enrollment")
+            .field("token", &"<redacted>")
+            .field("did", &self.did)
+            .field("role", &self.role)
+            .field("created_at", &self.created_at)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 /// Maps a credential ID (hex-encoded) to a user UUID.
@@ -85,6 +101,31 @@ pub async fn take_enrollment(
     token: &str,
 ) -> Result<Option<Enrollment>, AppError> {
     ks.take(enrollment_key(token)).await
+}
+
+/// Retrieve an enrollment by token without consuming it. Used by the
+/// admin management endpoints (list / update) where we don't want the
+/// side effect of `take_enrollment`.
+pub async fn get_enrollment(
+    ks: &KeyspaceHandle,
+    token: &str,
+) -> Result<Option<Enrollment>, AppError> {
+    ks.get(enrollment_key(token)).await
+}
+
+/// List every enrollment currently in the store. Deserialises each
+/// value; silently skips entries that fail to parse (corrupt / old
+/// schema) so a bad row can't hide the rest from admins.
+pub async fn list_enrollments(ks: &KeyspaceHandle) -> Result<Vec<Enrollment>, AppError> {
+    let pairs = ks.prefix_iter_raw(b"enroll:".to_vec()).await?;
+    let mut out = Vec::with_capacity(pairs.len());
+    for (_key, value) in pairs {
+        match serde_json::from_slice::<Enrollment>(&value) {
+            Ok(e) => out.push(e),
+            Err(e) => tracing::warn!(error = %e, "skipping unparseable enrollment entry"),
+        }
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------

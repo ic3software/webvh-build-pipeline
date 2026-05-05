@@ -52,6 +52,11 @@ pub struct StoreConfig {
     pub cosmosdb_connection_string: Option<String>,
     /// Cosmos DB database name (default: `"webvh"`). Used by `store-cosmosdb` backend.
     pub cosmosdb_database: Option<String>,
+    /// Azure region name for Cosmos DB routing (e.g. `"eastus"`, `"westeurope"`,
+    /// or display form `"West US 2"`). Defaults to `"eastus"` when unset. The
+    /// SDK normalizes the name; see `azure_data_cosmos::Region` for the list
+    /// of well-known regions.
+    pub cosmosdb_region: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -183,21 +188,57 @@ impl Default for StoreConfig {
             firestore_database: None,
             cosmosdb_connection_string: None,
             cosmosdb_database: None,
+            cosmosdb_region: None,
         }
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct SecretsConfig {
     pub aws_secret_name: Option<String>,
     pub aws_region: Option<String>,
     pub gcp_project: Option<String>,
     pub gcp_secret_name: Option<String>,
+    /// Azure Key Vault DNS URL (e.g. `https://my-vault.vault.azure.net/`).
+    /// Required when `azure_secret_name` is set.
+    pub azure_vault_url: Option<String>,
+    /// Azure Key Vault secret name. Used by `azure-secrets` backend.
+    pub azure_secret_name: Option<String>,
     #[serde(default = "default_keyring_service")]
     pub keyring_service: String,
     /// Plaintext secrets stored directly in the config file.
     /// Only used when no secure backend (keyring, AWS, GCP) is compiled in.
     pub plaintext: Option<PlaintextSecrets>,
+    /// Plaintext-mode-only stash for the offline-bootstrap ephemeral
+    /// seed (base64url-no-pad, 32 raw bytes). Set during phase 1 of
+    /// the offline wizard when no secure backend is available, and
+    /// removed at the end of phase 2. Never populated when a secure
+    /// backend (keyring, AWS, GCP) is active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plaintext_bootstrap_seed: Option<String>,
+}
+
+// Manual `Debug` redacts the only secret-bearing field
+// (`plaintext_bootstrap_seed`) and delegates to `PlaintextSecrets`'s own
+// redacted Debug for the inline secrets. Cloud-secret-name fields are
+// non-secret references (operators paste them into config) so they stay.
+impl std::fmt::Debug for SecretsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SecretsConfig")
+            .field("aws_secret_name", &self.aws_secret_name)
+            .field("aws_region", &self.aws_region)
+            .field("gcp_project", &self.gcp_project)
+            .field("gcp_secret_name", &self.gcp_secret_name)
+            .field("azure_vault_url", &self.azure_vault_url)
+            .field("azure_secret_name", &self.azure_secret_name)
+            .field("keyring_service", &self.keyring_service)
+            .field("plaintext", &self.plaintext)
+            .field(
+                "plaintext_bootstrap_seed",
+                &self.plaintext_bootstrap_seed.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 /// VTA (Verifiable Trust Architecture) connection configuration.
@@ -213,16 +254,56 @@ pub struct VtaConfig {
     pub context_id: Option<String>,
 }
 
+/// How the service obtains its own operating identity (signing key, KA key, DID).
+///
+/// `Vta` (the default) means a parent VTA provisions and rotates the service's
+/// own keys at setup time. `SelfManaged` means the service generates its own
+/// keys and self-hosts a `did:webvh` identifier with no parent VTA — a
+/// daemon-only mode in v1. See `docs/self-managed-mode-spec.md`.
+#[derive(Debug, Default, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum IdentityMode {
+    #[default]
+    Vta,
+    SelfManaged,
+}
+
+/// Identity configuration — selects how the service's own keys and DID are
+/// produced.
+#[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct IdentityConfig {
+    #[serde(default)]
+    pub mode: IdentityMode,
+}
+
 /// Plaintext secret key material stored directly in the configuration file.
 ///
 /// **WARNING**: This is insecure and should only be used for testing/development.
 /// For production deployments, compile with a secure backend feature:
 /// `keyring`, `aws-secrets`, or `gcp-secrets`.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct PlaintextSecrets {
     pub signing_key: String,
     pub key_agreement_key: String,
     pub jwt_signing_key: String,
+    /// VTA credential bundle (base64url-encoded) for re-authenticating with VTA.
+    /// Optional — only present when the deployment integrates with a VTA host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vta_credential: Option<String>,
+}
+
+impl std::fmt::Debug for PlaintextSecrets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlaintextSecrets")
+            .field("signing_key", &"<redacted>")
+            .field("key_agreement_key", &"<redacted>")
+            .field("jwt_signing_key", &"<redacted>")
+            .field(
+                "vta_credential",
+                &self.vta_credential.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 fn default_keyring_service() -> String {
@@ -236,8 +317,11 @@ impl Default for SecretsConfig {
             aws_region: None,
             gcp_project: None,
             gcp_secret_name: None,
+            azure_vault_url: None,
+            azure_secret_name: None,
             keyring_service: default_keyring_service(),
             plaintext: None,
+            plaintext_bootstrap_seed: None,
         }
     }
 }
@@ -340,6 +424,10 @@ pub fn apply_env_overrides(
         &format!("{prefix}_STORE_COSMOSDB_DATABASE"),
         store.cosmosdb_database
     );
+    env_opt!(
+        &format!("{prefix}_STORE_COSMOSDB_REGION"),
+        store.cosmosdb_region
+    );
 
     // Auth
     env_parse!(
@@ -378,6 +466,14 @@ pub fn apply_env_overrides(
         &format!("{prefix}_SECRETS_GCP_SECRET_NAME"),
         secrets.gcp_secret_name
     );
+    env_opt!(
+        &format!("{prefix}_SECRETS_AZURE_VAULT_URL"),
+        secrets.azure_vault_url
+    );
+    env_opt!(
+        &format!("{prefix}_SECRETS_AZURE_SECRET_NAME"),
+        secrets.azure_secret_name
+    );
     env_str!(
         &format!("{prefix}_SECRETS_KEYRING_SERVICE"),
         secrets.keyring_service
@@ -386,7 +482,14 @@ pub fn apply_env_overrides(
     Ok(())
 }
 
-/// Initialize the tracing subscriber based on config.
+/// Initialize the global tracing subscriber based on config.
+///
+/// Uses `try_init` so that callers embedded inside a host process that has
+/// already installed a global subscriber (e.g. when this crate is consumed
+/// as a library, or when a test harness has set one up) get a no-op rather
+/// than a panic. The first installer wins; later attempts log a debug line
+/// and continue. Most production callers run as the daemon binary and are
+/// the first installer; the no-op path is for embedded use cases.
 pub fn init_tracing(log: &LogConfig) {
     use tracing_subscriber::EnvFilter;
 
@@ -394,8 +497,86 @@ pub fn init_tracing(log: &LogConfig) {
 
     let subscriber = tracing_subscriber::fmt().with_env_filter(filter);
 
-    match log.format {
-        LogFormat::Json => subscriber.json().init(),
-        LogFormat::Text => subscriber.init(),
+    let result = match log.format {
+        LogFormat::Json => subscriber.json().try_init(),
+        LogFormat::Text => subscriber.try_init(),
+    };
+    if let Err(e) = result {
+        // Best-effort message — we may have no subscriber to deliver it. Print
+        // to stderr as a fallback so the operator at least sees a hint when
+        // the embedding host's subscriber is silent.
+        eprintln!("tracing subscriber already initialised; continuing ({e})");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identity_mode_default_is_vta() {
+        assert_eq!(IdentityMode::default(), IdentityMode::Vta);
+        assert_eq!(IdentityConfig::default().mode, IdentityMode::Vta);
+    }
+
+    #[test]
+    fn identity_mode_serializes_kebab_case() {
+        let toml_str = toml::to_string(&IdentityConfig {
+            mode: IdentityMode::SelfManaged,
+        })
+        .unwrap();
+        assert!(
+            toml_str.contains(r#"mode = "self-managed""#),
+            "expected kebab-case `self-managed`, got: {toml_str}"
+        );
+
+        let toml_str = toml::to_string(&IdentityConfig {
+            mode: IdentityMode::Vta,
+        })
+        .unwrap();
+        assert!(
+            toml_str.contains(r#"mode = "vta""#),
+            "expected `vta`, got: {toml_str}"
+        );
+    }
+
+    #[test]
+    fn identity_config_deserializes_self_managed() {
+        let cfg: IdentityConfig = toml::from_str(r#"mode = "self-managed""#).unwrap();
+        assert_eq!(cfg.mode, IdentityMode::SelfManaged);
+    }
+
+    #[test]
+    fn identity_config_deserializes_vta() {
+        let cfg: IdentityConfig = toml::from_str(r#"mode = "vta""#).unwrap();
+        assert_eq!(cfg.mode, IdentityMode::Vta);
+    }
+
+    #[test]
+    fn identity_config_round_trips() {
+        let original = IdentityConfig {
+            mode: IdentityMode::SelfManaged,
+        };
+        let serialized = toml::to_string(&original).unwrap();
+        let deserialized: IdentityConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(original, deserialized);
+    }
+
+    #[test]
+    fn identity_config_missing_mode_defaults_to_vta() {
+        // An empty `[identity]` table (no `mode = ...`) should default to Vta
+        // — this is the back-compat path for existing VTA-mode configs that
+        // grow an `[identity]` section but don't yet set `mode`.
+        let cfg: IdentityConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.mode, IdentityMode::Vta);
+    }
+
+    #[test]
+    fn identity_config_unknown_mode_rejected() {
+        let result: Result<IdentityConfig, _> = toml::from_str(r#"mode = "bogus""#);
+        assert!(
+            result.is_err(),
+            "expected unknown mode to be rejected, got: {result:?}"
+        );
     }
 }

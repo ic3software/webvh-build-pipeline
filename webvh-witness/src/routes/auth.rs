@@ -8,7 +8,7 @@ use tracing::warn;
 use crate::acl::check_acl;
 use crate::auth::session::{
     Session, SessionState, create_authenticated_session, delete_session,
-    finalize_challenge_session, get_session, get_session_by_refresh, now_epoch, store_session,
+    finalize_challenge_session, get_session, now_epoch, store_session,
 };
 use crate::error::AppError;
 use crate::server::AppState;
@@ -80,7 +80,8 @@ pub async fn authenticate(
 ) -> Result<Json<AuthenticateResponse>, AppError> {
     let (did_resolver, _secrets_resolver, jwt_keys) = state.require_didcomm_auth()?;
 
-    let (msg, _signer_kid) =
+    // sender_base is the JWS-verified DID (unpack_signed enforced from == signer).
+    let (msg, sender_base) =
         affinidi_webvh_common::server::didcomm_unpack::unpack_signed(&body, did_resolver).await?;
 
     // Validate message type
@@ -120,13 +121,7 @@ pub async fn authenticate(
         return Err(AppError::Authentication("challenge mismatch".into()));
     }
 
-    // Validate DID matches (compare base DID without fragment)
-    let sender_did = msg
-        .from
-        .as_deref()
-        .ok_or_else(|| AppError::Authentication("missing sender DID".into()))?;
-    let sender_base = sender_did.split('#').next().unwrap_or(sender_did);
-
+    // sender_base is JWS-verified by unpack_signed.
     if sender_base != session.did {
         warn!(session_id, sender = %sender_base, expected = %session.did, "authentication rejected: DID mismatch");
         return Err(AppError::Authentication("DID mismatch".into()));
@@ -199,7 +194,8 @@ pub async fn refresh(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let (did_resolver, _secrets_resolver, jwt_keys) = state.require_didcomm_auth()?;
 
-    let (msg, _signer_kid) =
+    // sender_base is JWS-verified; refresh requires the holder's signed envelope.
+    let (msg, sender_base) =
         affinidi_webvh_common::server::didcomm_unpack::unpack_signed(&body, did_resolver).await?;
 
     if msg.typ != "https://affinidi.com/webvh/1.0/authenticate/refresh" {
@@ -215,14 +211,35 @@ pub async fn refresh(
         .and_then(|v| v.as_str())
         .ok_or_else(|| AppError::Authentication("missing refresh_token".into()))?;
 
-    // get_session_by_refresh returns Option<String> (session_id)
-    let session_id = get_session_by_refresh(&state.sessions_ks, refresh_token)
-        .await?
-        .ok_or_else(|| AppError::Authentication("session not found".into()))?;
+    // Atomically claim and consume the refresh-token → session_id index.
+    // Cross-replica safe via Redis GETDEL / DynamoDB DeleteItem
+    // ReturnValues=ALL_OLD / fjall mutex. Closes the rotation TOCTOU.
+    let session_id = affinidi_webvh_common::server::auth::session::take_session_id_by_refresh(
+        &state.sessions_ks,
+        refresh_token,
+    )
+    .await?
+    .ok_or_else(|| AppError::Authentication("session not found".into()))?;
 
     let session = get_session(&state.sessions_ks, &session_id)
         .await?
         .ok_or_else(|| AppError::Authentication("session not found".into()))?;
+
+    // Bind the JWS signer to the session DID. Without this check, a leaked
+    // refresh token plus any attacker-controlled DID is enough to rotate the
+    // victim's tokens — the signed envelope alone proves possession of *some*
+    // signing key, not the right one.
+    if sender_base != session.did {
+        warn!(
+            session_id = %session.session_id,
+            session_did = %session.did,
+            sender = %sender_base,
+            "refresh rejected: signer DID does not match session DID",
+        );
+        return Err(AppError::Authentication(
+            "signer DID does not match session DID".into(),
+        ));
+    }
 
     if session.state != SessionState::Authenticated {
         return Err(AppError::Authentication("invalid session state".into()));
@@ -256,6 +273,8 @@ pub async fn refresh(
         "data": {
             "access_token": token_response.access_token,
             "access_expires_at": token_response.access_expires_at,
+            "refresh_token": token_response.refresh_token,
+            "refresh_expires_at": token_response.refresh_expires_at,
         }
     })))
 }

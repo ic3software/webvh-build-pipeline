@@ -5,7 +5,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use tracing::debug;
 
-use crate::auth::AuthClaims;
+use crate::auth::AdminAuth;
 use crate::error::AppError;
 use crate::registry;
 use crate::server::AppState;
@@ -13,10 +13,13 @@ use crate::server::AppState;
 /// ANY /api/server/{instance_id}/{*path}
 /// ANY /api/witness/{instance_id}/{*path}
 ///
-/// Requires authentication to prevent SSRF via the proxy.
+/// Restricted to Admin role. The proxy forwards the caller's `Authorization`
+/// header to the backend, and the control plane and backends typically share
+/// JWT keys; gating on Admin keeps Owner-role JWTs from probing arbitrary
+/// backend routes via the proxy.
 pub async fn proxy_to_service(
     State(state): State<AppState>,
-    _auth: AuthClaims,
+    _auth: AdminAuth,
     Path((instance_id, path)): Path<(String, String)>,
     req: axum::extract::Request,
 ) -> Result<Response, AppError> {
@@ -68,8 +71,36 @@ pub async fn proxy_to_service(
         .map_err(|e| AppError::Internal(format!("proxy body: {e}")))?;
 
     let mut response = (status, body).into_response();
+    // Strip hop-by-hop headers (RFC 7230 §6.1) and per-connection metadata
+    // before forwarding the upstream response. Forwarding them through a
+    // proxy boundary can cause subtle bugs (e.g. browsers reusing keep-alive
+    // settings the upstream meant for its own peer) and surprise security
+    // posture (e.g. a `Set-Cookie` leaking into the admin UI's cookie jar).
     for (name, value) in resp_headers.iter() {
+        if is_hop_by_hop_or_unsafe_to_forward(name.as_str()) {
+            continue;
+        }
         response.headers_mut().insert(name.clone(), value.clone());
     }
     Ok(response)
+}
+
+fn is_hop_by_hop_or_unsafe_to_forward(name: &str) -> bool {
+    // Names compared case-insensitively (HTTP header names are case-
+    // insensitive per RFC 7230 §3.2). reqwest already lowercases.
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        // RFC 7230 §6.1 hop-by-hop headers
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+            // Cookies set by an upstream backend must not leak into the
+            // control plane's cookie jar / admin UI.
+            | "set-cookie"
+    )
 }

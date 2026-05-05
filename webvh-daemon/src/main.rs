@@ -1,4 +1,5 @@
 mod config;
+mod setup;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -40,8 +41,56 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run interactive setup wizard to generate config.toml
-    Setup,
+    /// Run interactive setup wizard to generate config.toml.
+    ///
+    /// Headless mode (for CI / scripted setup):
+    ///
+    /// 1. Run with `--setup-key-out <path> --context <id>` to mint an
+    ///    ephemeral did:key, persist it (chmod 0600), and print the
+    ///    `pnm contexts create` command the operator runs to enrol the
+    ///    setup DID in the VTA. Exits without touching anything else.
+    /// 2. Run again with `--setup-key-file <path>` to drive the rest of
+    ///    the wizard reusing the persisted setup DID — skips the
+    ///    interactive ACL-ready confirmation.
+    Setup {
+        /// Phase 1: mint an ephemeral did:key, persist to <path>, and
+        /// print the `pnm contexts create` command + exit.
+        #[arg(long, conflicts_with = "setup_key_file")]
+        setup_key_out: Option<PathBuf>,
+        /// Phase 2: reuse the setup DID persisted at <path>; skip the
+        /// interactive "Has the context been created?" confirmation.
+        #[arg(long, conflicts_with = "setup_key_out")]
+        setup_key_file: Option<PathBuf>,
+        /// Context id for phase 1's PNM command. Defaults to `webvh`.
+        #[arg(long, default_value = "webvh", requires = "setup_key_out")]
+        context: String,
+    },
+    /// Step 1/2 of the offline (air-gapped VTA) setup wizard.
+    ///
+    /// The ephemeral bootstrap seed is persisted to the configured
+    /// secrets backend (keyring / AWS / GCP / plaintext-in-config) —
+    /// not to a file.
+    SetupOfflinePrepare {
+        /// Path for the bootstrap-request.json file.
+        #[arg(long, default_value = "bootstrap-request.json")]
+        request: PathBuf,
+        /// Path for the pending state file (plain TOML, no secrets).
+        #[arg(long, default_value = "setup-offline-state.toml")]
+        state: PathBuf,
+    },
+    /// Step 2/2 of the offline setup wizard.
+    SetupOfflineComplete {
+        /// Path to the ASCII-armored sealed bundle from the VTA admin.
+        #[arg(long)]
+        bundle: PathBuf,
+        /// Expected SHA-256 digest (lowercase hex) of the armored
+        /// ciphertext; communicated out-of-band.
+        #[arg(long)]
+        expect_digest: String,
+        /// Path to the state file written by `setup-offline-prepare`.
+        #[arg(long, default_value = "setup-offline-state.toml")]
+        state: PathBuf,
+    },
     /// Run health check diagnostics
     Health,
     /// Add an ACL entry
@@ -168,10 +217,36 @@ async fn main() {
     print_banner();
 
     match cli.command {
-        Some(Command::Setup) => {
-            eprintln!("  Setup wizard not yet implemented for the daemon.");
-            eprintln!("  Configure each service individually, then create a combined config.toml.");
-            std::process::exit(1);
+        Some(Command::Setup {
+            setup_key_out,
+            setup_key_file,
+            context,
+        }) => {
+            if let Some(path) = setup_key_out {
+                if let Err(e) = setup::run_setup_phase1(&path, &context).await {
+                    eprintln!("Setup error: {e}");
+                    std::process::exit(1);
+                }
+            } else if let Err(e) = setup::run_wizard(cli.config, setup_key_file).await {
+                eprintln!("Setup error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::SetupOfflinePrepare { request, state }) => {
+            if let Err(e) = setup::run_setup_offline_prepare(cli.config, request, state).await {
+                eprintln!("Setup error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::SetupOfflineComplete {
+            bundle,
+            expect_digest,
+            state,
+        }) => {
+            if let Err(e) = setup::run_setup_offline_complete(bundle, expect_digest, state).await {
+                eprintln!("Setup error: {e}");
+                std::process::exit(1);
+            }
         }
         Some(Command::Health) => {
             if let Err(e) = run_health(cli.config).await {
@@ -1409,7 +1484,15 @@ async fn run_import_secrets(
 
     let (resolved_signing, resolved_ka, resolved_vta_cred) =
         if let Some(ref bundle_str) = vta_bundle {
-            let bundle = DidSecretsBundle::decode(bundle_str)
+            // vta-sdk 0.5 dropped DidSecretsBundle::decode — operators still
+            // paste a base64url blob, so deserialize inline:
+            // base64url → JSON → bundle.
+            use base64::Engine;
+            use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
+            let bundle_json = BASE64
+                .decode(bundle_str.as_bytes())
+                .map_err(|e| format!("failed to decode VTA secrets bundle base64: {e}"))?;
+            let bundle: DidSecretsBundle = serde_json::from_slice(&bundle_json)
                 .map_err(|e| format!("failed to decode VTA secrets bundle: {e}"))?;
 
             let mut signing = None;
@@ -1417,15 +1500,11 @@ async fn run_import_secrets(
 
             for entry in &bundle.secrets {
                 match entry.key_type {
-                    KeyType::Ed25519 => {
-                        if signing.is_none() {
-                            signing = Some(entry.private_key_multibase.clone());
-                        }
+                    KeyType::Ed25519 if signing.is_none() => {
+                        signing = Some(entry.private_key_multibase.clone());
                     }
-                    KeyType::X25519 => {
-                        if ka.is_none() {
-                            ka = Some(entry.private_key_multibase.clone());
-                        }
+                    KeyType::X25519 if ka.is_none() => {
+                        ka = Some(entry.private_key_multibase.clone());
                     }
                     _ => {}
                 }
@@ -1616,7 +1695,7 @@ fn print_banner() {
 
     eprintln!(
         r#"
-{cyan}██████╗ {magenta}█████╗ {yellow}███████╗{cyan}███╗   ███╗{magenta} ██████╗ {yellow}███╗   ██╗{reset}
+{cyan}██████╗ {magenta} █████╗ {yellow}███████╗{cyan}███╗   ███╗{magenta} ██████╗ {yellow}███╗   ██╗{reset}
 {cyan}██╔══██╗{magenta}██╔══██╗{yellow}██╔════╝{cyan}████╗ ████║{magenta}██╔═══██╗{yellow}████╗  ██║{reset}
 {cyan}██║  ██║{magenta}███████║{yellow}█████╗  {cyan}██╔████╔██║{magenta}██║   ██║{yellow}██╔██╗ ██║{reset}
 {cyan}██║  ██║{magenta}██╔══██║{yellow}██╔══╝  {cyan}██║╚██╔╝██║{magenta}██║   ██║{yellow}██║╚██╗██║{reset}

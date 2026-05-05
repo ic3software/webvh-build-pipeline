@@ -16,8 +16,28 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run interactive setup wizard to generate config.toml
-    Setup,
+    /// Run interactive setup wizard to generate config.toml.
+    ///
+    /// Headless mode (for CI / scripted setup):
+    ///
+    /// 1. Run with `--setup-key-out <path> --context <id>` to mint an
+    ///    ephemeral did:key, persist it (chmod 0600), and print the
+    ///    `pnm contexts create` command. Exits without further prompts.
+    /// 2. Run again with `--setup-key-file <path>` to drive the rest of
+    ///    the wizard reusing the persisted setup DID.
+    Setup {
+        /// Phase 1: mint an ephemeral did:key, persist to <path>, and
+        /// print the `pnm contexts create` command + exit.
+        #[arg(long, conflicts_with = "setup_key_file")]
+        setup_key_out: Option<PathBuf>,
+        /// Phase 2: reuse the setup DID persisted at <path>; skip the
+        /// interactive "Has the context been created?" confirmation.
+        #[arg(long, conflicts_with = "setup_key_out")]
+        setup_key_file: Option<PathBuf>,
+        /// Context id for phase 1's PNM command. Defaults to `webvh`.
+        #[arg(long, default_value = "webvh", requires = "setup_key_out")]
+        context: String,
+    },
     /// Run health check diagnostics
     Health,
     /// Add an access control entry
@@ -51,6 +71,139 @@ enum Command {
         #[arg(long)]
         id: String,
     },
+    /// Step 1/2 of the offline (air-gapped VTA) setup wizard.
+    ///
+    /// Runs the interactive prompts, writes the bootstrap-request.json +
+    /// ephemeral seed, and serialises the operator's answers to a state
+    /// TOML file. After the VTA admin returns a sealed bundle, run
+    /// `setup-offline-complete`.
+    SetupOfflinePrepare {
+        /// Path for the bootstrap-request.json file.
+        #[arg(long, default_value = "bootstrap-request.json")]
+        request: PathBuf,
+        /// Path for the pending state file (plain TOML, no secrets).
+        ///
+        /// The ephemeral bootstrap seed is persisted to the configured
+        /// secrets backend (keyring / AWS / GCP / plaintext-in-config),
+        /// not to a file.
+        #[arg(long, default_value = "setup-offline-state.toml")]
+        state: PathBuf,
+    },
+    /// Step 2/2 of the offline setup wizard.
+    ///
+    /// Opens the sealed bundle with the seed saved during step 1, then
+    /// persists the DID + keys + config + admin ACL per the choices
+    /// captured in the state file.
+    SetupOfflineComplete {
+        /// Path to the ASCII-armored sealed bundle from the VTA admin.
+        #[arg(long)]
+        bundle: PathBuf,
+        /// Expected SHA-256 digest (lowercase hex) of the armored
+        /// ciphertext; communicated out-of-band.
+        #[arg(long)]
+        expect_digest: String,
+        /// Path to the state file written by `setup-offline-prepare`.
+        #[arg(long, default_value = "setup-offline-state.toml")]
+        state: PathBuf,
+    },
+    /// Write an offline VTA bootstrap request (for air-gapped VTAs).
+    ///
+    /// Generates an ephemeral Ed25519 keypair and writes a JSON request
+    /// the operator ferries to the VTA admin. Keep the companion seed
+    /// file safe — it's needed to open the sealed response.
+    VtaRequest {
+        /// Path for the bootstrap-request.json file.
+        #[arg(long, default_value = "bootstrap-request.json")]
+        out: PathBuf,
+        /// Path for the ephemeral seed (keep this secret; chmod 0600 on Unix).
+        #[arg(long, default_value = "bootstrap-seed.bin")]
+        seed: PathBuf,
+        /// Operator-visible label identifying this request.
+        #[arg(long, default_value = "webvh-witness")]
+        label: String,
+        /// DIDComm mediator DID. Bound to the `webvh-server` template's
+        /// `MEDIATOR_DID` variable so the rendered DID document advertises
+        /// the right mediator endpoint.
+        #[arg(long)]
+        mediator_did: String,
+        /// VTA context the integration will live in. Embedded as
+        /// `contextHint` in the request so the VTA admin can run
+        /// `vta bootstrap provision-integration` without `--context`.
+        #[arg(long, default_value = "webvh")]
+        context: String,
+    },
+    /// Export this witness's DID + signing/KA keys as an HPKE-sealed
+    /// migration bundle. See `webvh-server export-sealed` for semantics.
+    ExportSealed {
+        /// Path to the receiver's bootstrap-request.json.
+        #[arg(long)]
+        request: PathBuf,
+        /// Path for the ASCII-armored sealed output.
+        #[arg(long, default_value = "sealed-export.txt")]
+        out: PathBuf,
+        /// Optional file to write the SHA-256 digest to. Always
+        /// printed to stderr regardless.
+        #[arg(long)]
+        digest_out: Option<PathBuf>,
+    },
+    /// Open a sealed `DidSecrets` migration bundle and import the
+    /// contained keys as this witness's identity.
+    ImportSealed {
+        /// Path to the ASCII-armored sealed bundle.
+        #[arg(long)]
+        bundle: PathBuf,
+        /// Expected SHA-256 digest of the armored ciphertext.
+        #[arg(long)]
+        expect_digest: String,
+        /// Path to the ephemeral seed the receiver saved when
+        /// generating the bootstrap-request.json.
+        #[arg(long, default_value = "bootstrap-seed.bin")]
+        seed: PathBuf,
+        /// Optional Ed25519 public key of the producer (multibase-
+        /// encoded, matches `#key-0` in the producer's DID document).
+        /// When supplied, the bundle's `DidSigned` assertion is
+        /// verified against it; omit to fall back to digest-only trust.
+        #[arg(long)]
+        producer_pubkey: Option<String>,
+        /// Optional Ed25519 JWT signing key (multibase-encoded,
+        /// auto-generated if omitted).
+        #[arg(long)]
+        jwt_key: Option<String>,
+        /// Overwrite existing secrets without prompting.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Open a sealed VTA bootstrap response.
+    ///
+    /// Reads the armored bundle the operator ferried back, verifies the
+    /// out-of-band digest, opens the HPKE sealed payload with the
+    /// ephemeral seed, and emits the DID document + signed DID log for
+    /// import via `webvh-server bootstrap-did` on the hosting server.
+    VtaOpen {
+        /// Path to the ASCII-armored sealed bundle.
+        #[arg(long)]
+        bundle: PathBuf,
+        /// Expected SHA-256 digest of the armored ciphertext (from the
+        /// operator, out-of-band).
+        #[arg(long)]
+        expect_digest: String,
+        /// Path to the ephemeral seed saved by `vta-request`.
+        #[arg(long, default_value = "bootstrap-seed.bin")]
+        seed: PathBuf,
+        /// Where to write the rendered DID document as JSON.
+        #[arg(long, default_value = "witness-did.json")]
+        did_doc_out: PathBuf,
+        /// Where to write the signed DID log (JSONL). Omitted when the
+        /// template didn't emit a WebvhLog output.
+        #[arg(long, default_value = "witness-did.jsonl")]
+        did_log_out: PathBuf,
+        /// Where to save the minted private signing + KA key pair plus
+        /// VTA trust material (authorization VC, pinned VTA DID) as JSON.
+        /// Feed into `webvh-witness setup` to persist via the configured
+        /// secret backend.
+        #[arg(long, default_value = "witness-secrets.json")]
+        secrets_out: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -60,8 +213,17 @@ async fn main() {
     print_banner();
 
     match cli.command {
-        Some(Command::Setup) => {
-            if let Err(e) = setup::run_wizard(cli.config).await {
+        Some(Command::Setup {
+            setup_key_out,
+            setup_key_file,
+            context,
+        }) => {
+            if let Some(path) = setup_key_out {
+                if let Err(e) = setup::run_setup_phase1(&path, &context).await {
+                    eprintln!("Setup error: {e}");
+                    std::process::exit(1);
+                }
+            } else if let Err(e) = setup::run_wizard(cli.config, setup_key_file).await {
                 eprintln!("Setup error: {e}");
                 std::process::exit(1);
             }
@@ -104,6 +266,100 @@ async fn main() {
         }
         Some(Command::DeleteWitness { id }) => {
             if let Err(e) = run_delete_witness(cli.config, id).await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::SetupOfflinePrepare { request, state }) => {
+            if let Err(e) = setup::run_setup_offline_prepare(cli.config, request, state).await {
+                eprintln!("Setup error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::SetupOfflineComplete {
+            bundle,
+            expect_digest,
+            state,
+        }) => {
+            if let Err(e) = setup::run_setup_offline_complete(bundle, expect_digest, state).await {
+                eprintln!("Setup error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::ExportSealed {
+            request,
+            out,
+            digest_out,
+        }) => {
+            if let Err(e) = run_export_sealed(cli.config, request, out, digest_out).await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::ImportSealed {
+            bundle,
+            expect_digest,
+            seed,
+            producer_pubkey,
+            jwt_key,
+            force,
+        }) => {
+            if let Err(e) = run_import_sealed(
+                cli.config,
+                bundle,
+                expect_digest,
+                seed,
+                producer_pubkey,
+                jwt_key,
+                force,
+            )
+            .await
+            {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::VtaRequest {
+            out,
+            seed,
+            label,
+            mediator_did,
+            context,
+        }) => {
+            if let Err(e) = affinidi_webvh_common::server::vta_setup::run_offline_request_cli(
+                &out,
+                &seed,
+                &label,
+                "webvh-witness",
+                "webvh-server",
+                &[("MEDIATOR_DID", mediator_did.as_str())],
+                &context,
+            )
+            .await
+            {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::VtaOpen {
+            bundle,
+            expect_digest,
+            seed,
+            did_doc_out,
+            did_log_out,
+            secrets_out,
+        }) => {
+            if let Err(e) = affinidi_webvh_common::server::vta_setup::run_offline_open_cli(
+                &bundle,
+                &expect_digest,
+                &seed,
+                &did_doc_out,
+                &did_log_out,
+                &secrets_out,
+                affinidi_webvh_common::server::vta_setup::OfflineOpenNextStep::Setup {
+                    binary: "webvh-witness",
+                },
+            ) {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
@@ -278,6 +534,183 @@ async fn run_server(config_path: Option<PathBuf>) {
         tracing::error!("server error: {e}");
         std::process::exit(1);
     }
+}
+
+async fn run_export_sealed(
+    config_path: Option<PathBuf>,
+    request: PathBuf,
+    out: PathBuf,
+    digest_out: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = AppConfig::load(config_path)?;
+
+    let producer_did = config
+        .server_did
+        .clone()
+        .ok_or("server_did not set in config — run setup first")?;
+
+    let secret_store = secret_store::create_secret_store(&config)?;
+    let secrets = secret_store
+        .get()
+        .await?
+        .ok_or("no secrets found — run setup first")?;
+
+    let info = affinidi_webvh_common::server::vta_setup::export_sealed_did_secrets(
+        &request,
+        &out,
+        &producer_did,
+        &producer_did,
+        secrets.signing_key.clone(),
+        secrets.key_agreement_key.clone(),
+        affinidi_webvh_common::server::vta_setup::ExportAssertionMode::DidSigned {
+            signing_key_multibase: secrets.signing_key.clone(),
+            verification_method: format!("{producer_did}#key-0"),
+        },
+    )
+    .await?;
+
+    if let Some(ref digest_path) = digest_out {
+        if let Some(parent) = digest_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(digest_path, format!("{}\n", info.digest))?;
+    }
+
+    let producer_pub = affinidi_tdk::secrets_resolver::secrets::Secret::from_multibase(
+        &secrets.signing_key,
+        None,
+    )?
+    .get_public_keymultibase()?;
+
+    eprintln!();
+    eprintln!("  Sealed export ready.");
+    eprintln!();
+    eprintln!("  Out:            {}", info.out_path.display());
+    eprintln!("  Recipient DID:  {}", info.recipient_did);
+    eprintln!("  Bundle id:      {}", info.bundle_id_hex);
+    eprintln!();
+    eprintln!("  SHA-256 digest (send OOB to receiver):");
+    eprintln!("    {}", info.digest);
+    if let Some(ref p) = digest_out {
+        eprintln!("  Digest also written to {}", p.display());
+    }
+    eprintln!();
+    eprintln!("  Producer assertion mode: DidSigned. The bundle is signed by");
+    eprintln!("  this witness's `#key-0` Ed25519 key. Receivers who pin the");
+    eprintln!("  pubkey get cryptographic verification; without it the OOB");
+    eprintln!("  digest stays the only anchor.");
+    eprintln!();
+    eprintln!("  Producer pubkey (share with receiver — matches #key-0):");
+    eprintln!("    {producer_pub}");
+    eprintln!();
+    eprintln!("  Next on the receiver:");
+    eprintln!(
+        "    webvh-witness import-sealed --bundle {} \\\n      --expect-digest {} \\\n      --producer-pubkey {producer_pub}",
+        info.out_path.display(),
+        info.digest
+    );
+    eprintln!();
+
+    Ok(())
+}
+
+async fn run_import_sealed(
+    config_path: Option<PathBuf>,
+    bundle: PathBuf,
+    expect_digest: String,
+    seed: PathBuf,
+    producer_pubkey: Option<String>,
+    jwt_key: Option<String>,
+    force: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use affinidi_tdk::secrets_resolver::secrets::Secret;
+    use affinidi_webvh_common::server::vta_setup::{
+        generate_ed25519_multibase, open_sealed_did_secrets,
+    };
+
+    let config = AppConfig::load(config_path)?;
+    let secret_store = secret_store::create_secret_store(&config)?;
+
+    if !force && let Ok(Some(_)) = secret_store.get().await {
+        return Err("secrets already exist — use --force to overwrite".into());
+    }
+
+    let expected_pubkey_bytes = match producer_pubkey.as_deref() {
+        Some(mb) => Some(decode_ed25519_pubkey_multibase(mb)?),
+        None => None,
+    };
+
+    let armor =
+        std::fs::read_to_string(&bundle).map_err(|e| format!("read {}: {e}", bundle.display()))?;
+    let result = open_sealed_did_secrets(
+        &armor,
+        &expect_digest,
+        &seed,
+        expected_pubkey_bytes.as_ref(),
+    )?;
+
+    Secret::from_multibase(&result.signing_key_multibase, None)
+        .map_err(|e| format!("invalid signing key in bundle: {e}"))?;
+    Secret::from_multibase(&result.key_agreement_multibase, None)
+        .map_err(|e| format!("invalid key-agreement key in bundle: {e}"))?;
+
+    let resolved_jwt = match jwt_key {
+        Some(key) => {
+            Secret::from_multibase(&key, None)
+                .map_err(|e| format!("invalid JWT signing key: {e}"))?;
+            key
+        }
+        None => {
+            eprintln!("  Generated JWT signing key.");
+            generate_ed25519_multibase()
+        }
+    };
+
+    let server_secrets = secret_store::ServerSecrets {
+        signing_key: result.signing_key_multibase,
+        key_agreement_key: result.key_agreement_multibase,
+        jwt_signing_key: resolved_jwt,
+        vta_credential: None,
+    };
+
+    secret_store.set(&server_secrets).await?;
+
+    eprintln!();
+    eprintln!("  Sealed bundle opened and imported.");
+    eprintln!();
+    eprintln!("  DID:            {}", result.did);
+    if result.assertion_verified {
+        eprintln!(
+            "  Producer DID:   {} (DidSigned — signature verified)",
+            result.producer_did
+        );
+    } else {
+        eprintln!(
+            "  Producer DID:   {} (informational — no producer pubkey supplied)",
+            result.producer_did
+        );
+    }
+    eprintln!();
+    eprintln!(
+        "  Note: update server_did in config.toml to {} if not already set.",
+        result.did
+    );
+    eprintln!();
+
+    Ok(())
+}
+
+fn decode_ed25519_pubkey_multibase(mb: &str) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+    let (_, raw) =
+        multibase::decode(mb).map_err(|e| format!("invalid producer pubkey multibase: {e}"))?;
+    let pk_bytes: &[u8] = if raw.len() == 34 && raw[0] == 0xed && raw[1] == 0x01 {
+        &raw[2..]
+    } else {
+        &raw[..]
+    };
+    pk_bytes
+        .try_into()
+        .map_err(|_| "producer pubkey is not a 32-byte Ed25519 key".into())
 }
 
 fn print_banner() {
