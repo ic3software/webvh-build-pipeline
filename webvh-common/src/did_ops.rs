@@ -4,7 +4,10 @@
 //! This module contains the data types and validation/extraction functions that
 //! are independent of any particular server's `AppState` or business logic.
 
+use didwebvh_rs::DIDWebVHState;
 use didwebvh_rs::log_entry::LogEntry;
+use didwebvh_rs::log_entry_state::{LogEntryState, LogEntryValidationStatus};
+use didwebvh_rs::parameters::Parameters;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -125,6 +128,129 @@ pub fn validate_did_jsonl(content: &str) -> Result<(), String> {
         )),
         None => Err("did.jsonl latest entry has no resolvable state.id".into()),
     }
+}
+
+/// Verify the cryptographic proofs on every log entry in a `did.jsonl`
+/// chain.
+///
+/// This is the semantic-correctness gate for the DID method —
+/// `validate_did_jsonl` is structural-only (it parses each line and
+/// confirms the latest `state.id` is `did:webvh:`) but does not check
+/// that the embedded `proof` actually verifies against
+/// `parameters.updateKeys`. An authenticated owner (or admin via
+/// force) could otherwise publish a `did.jsonl` whose proof is invalid
+/// or signed with an unknown key — clients resolving the DID would
+/// then encounter a chain that doesn't verify and produce inscrutable
+/// downstream failures.
+///
+/// Wraps the upstream `didwebvh-rs::DIDWebVHState::validate` —
+/// signature verification, parameter-transition rules, hash-chain,
+/// pre-rotation key authorisation, and post-deactivation tamper
+/// detection are all enforced. Witness proofs are NOT validated here
+/// (they're optional and uploaded separately via
+/// `MSG_WITNESS_PUBLISH`); use `assert_complete()` if you need to
+/// reject any partial-chain truncation.
+///
+/// Returns the structural-validation message verbatim on parse-time
+/// failures and a "proof verification failed: ..." prefix on the
+/// upstream verifier's report.
+pub fn verify_did_log_proofs(content: &str) -> Result<(), String> {
+    // Re-run the structural parse so callers can use this function
+    // as a single gate. Cheap relative to the proof-verification cost.
+    validate_did_jsonl(content)?;
+
+    let mut state = DIDWebVHState::default();
+    let mut version = None;
+    for (idx, line) in content.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let entry = LogEntry::deserialize_string(line, version)
+            .map_err(|e| format!("invalid log entry at line {}: {e}", idx + 1))?;
+        version = Some(entry.get_webvh_version());
+        let version_number = entry
+            .get_version_id_fields()
+            .map_err(|e| format!("invalid versionId at line {}: {e}", idx + 1))?
+            .0;
+        state.log_entries_mut().push(LogEntryState {
+            log_entry: entry,
+            version_number,
+            validation_status: LogEntryValidationStatus::NotValidated,
+            validated_parameters: Parameters::default(),
+        });
+    }
+
+    let report = state
+        .validate()
+        .map_err(|e| format!("proof verification failed: {e}"))?;
+
+    // assert_complete rejects truncation — any entry that failed
+    // verification or any post-deactivation tampering surfaces here.
+    report
+        .assert_complete()
+        .map_err(|e| format!("proof verification failed (chain incomplete): {e}"))?;
+
+    Ok(())
+}
+
+/// Verify that a `did:webvh:...` identifier names the host described
+/// by `server_base_url` and resolves at the slot named by `request_path`.
+///
+/// Used by atomic claim-and-publish flows where the caller asserts a
+/// pre-built `did.jsonl`. Without this check, anyone with write
+/// access to a slot could upload content claiming a different host
+/// (impersonation) or a different path on this host (claim-jumping).
+///
+/// `server_base_url` is the URL the server publishes DIDs at — i.e.
+/// the resulting hosting URL is `<server_base_url>/<request_path>/did.jsonl`.
+/// Trailing slashes on `server_base_url` are tolerated.
+pub fn validate_did_id_matches_request(
+    did_id: &str,
+    request_path: &str,
+    server_base_url: &str,
+) -> Result<(), String> {
+    use didwebvh_rs::url::WebVHURL;
+    use url::Url;
+
+    let id_parsed = WebVHURL::parse_did_url(did_id)
+        .map_err(|e| format!("did_log's DID identifier {did_id} is not a valid did:webvh: {e}"))?;
+
+    let expected_str = format!(
+        "{}/{request_path}/did.jsonl",
+        server_base_url.trim_end_matches('/')
+    );
+    let expected_url = Url::parse(&expected_str).map_err(|e| {
+        format!(
+            "internal: server_base_url {server_base_url} cannot form a valid URL when combined \
+             with the requested path: {e}"
+        )
+    })?;
+    let expected_parsed = WebVHURL::parse_url(&expected_url).map_err(|e| {
+        format!(
+            "internal: the URL this server would publish at ({expected_str}) cannot be expressed \
+             as a webvh URL: {e}"
+        )
+    })?;
+
+    if id_parsed.domain != expected_parsed.domain || id_parsed.port != expected_parsed.port {
+        return Err(format!(
+            "did_log's DID host (domain={}, port={:?}) does not match this server's host \
+             (domain={}, port={:?})",
+            id_parsed.domain, id_parsed.port, expected_parsed.domain, expected_parsed.port,
+        ));
+    }
+    if id_parsed.path != expected_parsed.path {
+        return Err(format!(
+            "did_log's DID path '{}' does not resolve at the requested path '{}' on this server \
+             (server would publish at '{}')",
+            id_parsed.path.trim_matches('/'),
+            request_path,
+            expected_parsed.path.trim_matches('/'),
+        ));
+    }
+
+    Ok(())
 }
 
 /// Extract the `did:webvh:...` identifier from the last non-blank line of

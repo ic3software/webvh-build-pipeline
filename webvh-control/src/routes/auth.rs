@@ -1,7 +1,10 @@
 //! DIDComm challenge-response authentication routes.
 
+use std::net::SocketAddr;
+
 use axum::Json;
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
+use axum::http::HeaderMap;
 use tracing::{info, warn};
 
 use affinidi_webvh_common::server::auth::constant_time_eq;
@@ -9,14 +12,31 @@ use affinidi_webvh_common::{ChallengeData, ChallengeRequest, ChallengeResponse};
 
 use crate::auth::session::{self, Session, SessionState, now_epoch};
 use crate::error::AppError;
+use crate::rate_limit::resolve_client_ip;
 use crate::server::AppState;
 
-/// Maximum concurrent pending challenges per DID.
-const MAX_PENDING_CHALLENGES_PER_DID: usize = 10;
+/// Maximum concurrent pending challenges per DID. Combined with the
+/// global cap on the `pending_challenges` tracker on `AppState`, this
+/// bounds the unauthenticated challenge-endpoint surface against both
+/// per-DID floods and DID-sweep attacks.
+const MAX_PENDING_CHALLENGES_PER_DID: u64 = 10;
 
 /// POST /api/auth/challenge — request a challenge nonce.
+///
+/// Two layers of rate-limit defence:
+/// 1. Per-IP fixed-window counter (`IpRateLimiter`) — caps requests
+///    from any single IP regardless of which DID they're issuing
+///    challenges for. Trusted-proxy XFF resolution per
+///    `server.trusted_proxies` config.
+/// 2. Per-DID + global pending-challenge cap (`PendingChallengeTracker`)
+///    — caps the active session population.
+///
+/// Replaced an earlier O(N) `prefix_iter_raw("session:")` scan with
+/// the O(1) in-memory tracker (review SM3).
 pub async fn challenge(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(req): Json<ChallengeRequest>,
 ) -> Result<Json<ChallengeResponse>, AppError> {
     // Input validation
@@ -24,22 +44,26 @@ pub async fn challenge(
         return Err(AppError::Validation("DID exceeds maximum length".into()));
     }
 
-    // Rate limit pending challenges per DID
-    let sessions = state.sessions_ks.prefix_iter_raw("session:").await?;
-    let pending = sessions
-        .iter()
-        .filter(|(_, v)| {
-            serde_json::from_slice::<Session>(v)
-                .map(|s| s.did == req.did && s.state == SessionState::ChallengeSent)
-                .unwrap_or(false)
-        })
-        .count();
-    if pending >= MAX_PENDING_CHALLENGES_PER_DID {
-        warn!(did = %req.did, pending, "challenge rate limited");
-        return Err(AppError::Validation(
-            "too many pending challenges — try again later".into(),
-        ));
-    }
+    // IP rate limit (defence in depth before any session-storage I/O).
+    let xff = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
+    let client_ip = resolve_client_ip(addr.ip(), xff, &state.config.server.trusted_proxies);
+    state
+        .ip_rate_limiter
+        .try_consume(client_ip, now_epoch())
+        .inspect_err(|e| {
+            warn!(ip = %client_ip, error = %e, "challenge IP rate limited");
+        })?;
+
+    // Reserve a pending-challenge slot. Rejects on per-DID cap or
+    // global cap; the global cap is the defence against an attacker
+    // sweeping millions of distinct DIDs.
+    state
+        .pending_challenges
+        .try_issue(&req.did, MAX_PENDING_CHALLENGES_PER_DID)
+        .await
+        .inspect_err(|e| {
+            warn!(did = %req.did, error = %e, "challenge rate limited");
+        })?;
 
     let challenge_bytes = rand::random::<[u8; 32]>();
     let challenge = challenge_bytes
@@ -121,6 +145,11 @@ pub async fn authenticate(
     let now = now_epoch();
     if now.saturating_sub(session.created_at) > state.config.auth.challenge_ttl {
         session::delete_session(&state.sessions_ks, session_id).await?;
+        // Free the pending-challenge slot so the legitimate caller
+        // can re-issue. Without this, an expired challenge would
+        // hold the slot until the per-DID cap caused subsequent
+        // challenges to fail with the wrong error.
+        state.pending_challenges.release(&session.did).await;
         return Err(AppError::Authentication("challenge expired".into()));
     }
 
@@ -147,6 +176,10 @@ pub async fn authenticate(
         state.config.auth.refresh_token_expiry,
     )
     .await?;
+
+    // Free the pending-challenge slot now that the session has
+    // transitioned to Authenticated.
+    state.pending_challenges.release(&session.did).await;
 
     info!(did = %session.did, role = %role, "authenticated via DIDComm");
 

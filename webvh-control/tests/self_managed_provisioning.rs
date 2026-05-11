@@ -79,8 +79,15 @@ async fn tenant_provisioning_succeeds_with_self_managed_config() {
         http_client: reqwest::Client::new(),
         didcomm_service: Arc::new(OnceLock::new()),
         stats_collector: Arc::new(StatsCollector::new()),
-        stats_ks,
+        stats_ks: stats_ks.clone(),
+        timeseries_ks: store.keyspace("timeseries").expect("timeseries ks"),
         signing_key_bytes: None,
+        replay_cache: Arc::new(affinidi_webvh_control::replay::ReplayCache::new()),
+        path_locks: affinidi_webvh_control::path_locks::PathLocks::new(),
+        pending_challenges: Arc::new(
+            affinidi_webvh_control::pending_challenges::PendingChallengeTracker::new(),
+        ),
+        ip_rate_limiter: Arc::new(affinidi_webvh_control::rate_limit::IpRateLimiter::new()),
     };
 
     // 4. ACL the tenant VTA's owner DID (the entity that an external VTA
@@ -105,7 +112,7 @@ async fn tenant_provisioning_succeeds_with_self_managed_config() {
     };
 
     // 5. Phase 1 — tenant requests a DID slot (analog to MSG_DID_REQUEST).
-    let request = create_did(&auth, &state, Some("tenant/alice"))
+    let request = create_did(&auth, &state, Some("tenant/alice"), false)
         .await
         .expect("create_did");
     assert_eq!(request.mnemonic, "tenant/alice");

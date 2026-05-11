@@ -45,11 +45,13 @@ pub fn build_control_router(state: AppState) -> Result<Router, DIDCommServiceErr
         // VTA provisioning protocol
         .route(MSG_AUTHENTICATE, handler_fn(handle_authenticate))?
         .route(MSG_DID_REQUEST, handler_fn(handle_webvh_message))?
+        .route(MSG_DID_REGISTER, handler_fn(handle_webvh_message))?
         .route(MSG_DID_PUBLISH, handler_fn(handle_webvh_message))?
         .route(MSG_WITNESS_PUBLISH, handler_fn(handle_webvh_message))?
         .route(MSG_INFO_REQUEST, handler_fn(handle_webvh_message))?
         .route(MSG_LIST_REQUEST, handler_fn(handle_webvh_message))?
         .route(MSG_DELETE, handler_fn(handle_webvh_message))?
+        .route(MSG_DID_CHANGE_OWNER, handler_fn(handle_webvh_message))?
         // Server registration
         .route(MSG_SERVER_REGISTER, handler_fn(handle_server_register))?
         // Health pong from servers
@@ -187,13 +189,22 @@ async fn handle_webvh_message(
 }
 
 /// Compute the wire-level (response_type, response_body) for any inbound
-/// VTA management message — wraps the ACL check and `dispatch_did_op` so
-/// the auth + dispatch pipeline is testable as a single unit, without an
-/// `ATM`-backed `HandlerContext`. Always returns a tuple; ACL denials and
-/// dispatch errors surface as problem-report bodies.
+/// VTA management message — wraps the ACL check, replay-cache gate, and
+/// `dispatch_did_op` so the auth + dispatch pipeline is testable as a
+/// single unit, without an `ATM`-backed `HandlerContext`. Always
+/// returns a tuple; ACL denials, replay rejections, and dispatch
+/// errors surface as problem-report bodies.
 async fn run_webvh_dispatch(state: &AppState, sender: &str, message: &Message) -> (String, Value) {
+    // Replay gate: reject any (sender, msg.id) we've seen within the
+    // freshness window. Runs after ACL so an unauthenticated flood
+    // can't poison the cache for legitimate senders.
     match check_acl(&state.acl_ks, sender).await {
         Ok(role) => {
+            if let Err(e) = state.replay_cache.check_and_insert(sender, &message.id) {
+                let code = map_app_error_code(&e);
+                warn!(code, msg_type = %message.typ, did = sender, msg_id = %message.id, "DIDComm replay rejected");
+                return problem_report(code, &e.to_string());
+            }
             let auth = AuthClaims {
                 did: sender.to_string(),
                 role,
@@ -221,7 +232,17 @@ async fn run_webvh_dispatch(state: &AppState, sender: &str, message: &Message) -
 // DID operation dispatch
 // ---------------------------------------------------------------------------
 
-async fn dispatch_did_op(
+/// Single transport-agnostic dispatch table for VTA DID-management
+/// `MSG_*` types.
+///
+/// Both DIDComm transports — the framework router (mediator-routed,
+/// E2E-encrypted) and the HTTP-signed `POST /api/didcomm` route
+/// (signed-but-not-encrypted) — call this. Without it, the two had
+/// drifted: the HTTP-signed dispatcher was missing `MSG_DID_REGISTER`
+/// entirely, and the two emitted different protocol error codes for
+/// identical wire conditions. See
+/// `docs/dispatcher-consolidation-design.md` for the rationale.
+pub async fn dispatch_did_op(
     auth: &AuthClaims,
     state: &AppState,
     msg: &Message,
@@ -229,10 +250,48 @@ async fn dispatch_did_op(
     match msg.typ.as_str() {
         MSG_DID_REQUEST => {
             let path = msg.body.get("path").and_then(|v| v.as_str());
-            let result = did_ops::create_did(auth, state, path).await?;
+            let force = msg
+                .body
+                .get("force")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let result = did_ops::create_did(auth, state, path, force).await?;
+            // No fan-out on force-replace: see `routes/did_manage::request_uri`.
             let server_did = state.config.server_did.as_deref().unwrap_or_default();
             Ok((
                 MSG_DID_OFFER.to_string(),
+                json!({
+                    "mnemonic": result.mnemonic,
+                    "did_url": result.did_url,
+                    "server_did": server_did,
+                }),
+            ))
+        }
+        MSG_DID_REGISTER => {
+            // Atomic claim-and-publish — see did_ops::register_did_atomic.
+            // Body shape mirrors `DidRegisterRequest` from webvh-common.
+            let path = msg
+                .body
+                .get("path")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| AppError::Validation("missing 'path' in body".into()))?;
+            let did_log = msg
+                .body
+                .get("did_log")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| AppError::Validation("missing 'did_log' in body".into()))?;
+            let force = msg
+                .body
+                .get("force")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            let result = did_ops::register_did_atomic(auth, state, path, did_log, force).await?;
+            server_push::notify_servers_did(state, result.mnemonic.clone());
+
+            let server_did = state.config.server_did.as_deref().unwrap_or_default();
+            Ok((
+                MSG_DID_REGISTER_CONFIRM.to_string(),
                 json!({
                     "mnemonic": result.mnemonic,
                     "did_url": result.did_url,
@@ -397,6 +456,27 @@ async fn dispatch_did_op(
                 json!({
                     "mnemonic": mnemonic,
                     "did_id": did_id,
+                }),
+            ))
+        }
+        MSG_DID_CHANGE_OWNER => {
+            let mnemonic = msg
+                .body
+                .get("mnemonic")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| AppError::Validation("missing 'mnemonic' in body".into()))?;
+            let new_owner = msg
+                .body
+                .get("new_owner")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| AppError::Validation("missing 'new_owner' in body".into()))?;
+            let record = did_ops::change_did_owner(auth, state, mnemonic, new_owner).await?;
+            Ok((
+                MSG_DID_CHANGE_OWNER_CONFIRM.to_string(),
+                json!({
+                    "mnemonic": record.mnemonic,
+                    "owner": record.owner,
+                    "updated_at": record.updated_at,
                 }),
             ))
         }
@@ -617,6 +697,32 @@ async fn handle_server_register(
         .and_then(|v| v.as_str())
         .unwrap_or_default();
 
+    // Apply the same URL allowlist that the REST `register_service`
+    // route enforces. Without this gate, an ACL'd Service-role caller
+    // could register an arbitrary URL (cloud-metadata IP, RFC1918,
+    // attacker-controlled host) and then wait for an Admin to hit
+    // `/api/proxy/server/{instance_id}/...` — `proxy_to_service` would
+    // forward the Admin's `Authorization: Bearer ...` to that URL.
+    if let Err(e) =
+        registry::validate_registered_url(public_url, &state.config.registry.url_allowlist)
+    {
+        warn!(
+            did = sender,
+            requested = public_url,
+            "DIDComm server registration rejected: URL host not in registry.url_allowlist",
+        );
+        return Ok(Some(
+            DIDCommResponse::new(
+                MSG_PROBLEM_REPORT.to_string(),
+                json!({
+                    "code": "e.p.registration.unauthorized",
+                    "comment": e.user_message(),
+                }),
+            )
+            .thid(message.id.clone()),
+        ));
+    }
+
     let label = message
         .body
         .get("label")
@@ -710,36 +816,16 @@ fn problem_report(code: &str, comment: &str) -> (String, Value) {
 
 /// Map an internal `AppError` to its DIDComm protocol error code.
 ///
-/// **Stability:** the substring matches against `Validation` / `QuotaExceeded`
-/// messages are intentionally narrow — they live next to a table-driven test
-/// (see `mod tests` below) so a wording change in `AppError(...)` literals
-/// elsewhere in the workspace fails the test rather than silently re-routes
-/// to a different protocol code.
+/// Thin wrapper around `AppError::didcomm_code()` — kept as a function
+/// alias so the existing call sites (and the
+/// `map_app_error_code_pinned_table` test) don't need to chase the
+/// rename. The shared implementation in `webvh-common::server::error`
+/// is backed by `ValidationKind` / `QuotaKind` tags rather than
+/// substring sniffing, so a wording change in any
+/// `AppError::Validation("...")` literal can no longer silently
+/// re-route the protocol code.
 fn map_app_error_code(err: &AppError) -> &'static str {
-    match err {
-        AppError::Unauthorized(_) | AppError::Forbidden(_) => "e.p.did.unauthorized",
-        AppError::QuotaExceeded(msg) => {
-            if msg.contains("size") {
-                "e.p.did.size-exceeded"
-            } else {
-                "e.p.did.quota-exceeded"
-            }
-        }
-        AppError::Conflict(_) => "e.p.did.path-unavailable",
-        AppError::NotFound(_) => "e.p.did.mnemonic-not-found",
-        AppError::Validation(msg) => {
-            if msg.contains("log entry") || msg.contains("jsonl") || msg.contains("JSONL") {
-                "e.p.did.invalid-log"
-            } else if msg.contains("path") {
-                "e.p.did.path-invalid"
-            } else if msg.contains("witness") {
-                "e.p.did.witness-invalid"
-            } else {
-                "e.p.did.validation-error"
-            }
-        }
-        _ => "e.p.did.internal-error",
-    }
+    err.didcomm_code()
 }
 
 #[cfg(test)]
@@ -809,8 +895,13 @@ mod tests {
             http_client: reqwest::Client::new(),
             didcomm_service: Arc::new(OnceLock::new()),
             stats_collector: Arc::new(StatsCollector::new()),
-            stats_ks,
+            stats_ks: stats_ks.clone(),
+            timeseries_ks: store.keyspace("timeseries").expect("timeseries ks"),
             signing_key_bytes: None,
+            replay_cache: Arc::new(crate::replay::ReplayCache::new()),
+            path_locks: crate::path_locks::PathLocks::new(),
+            pending_challenges: Arc::new(crate::pending_challenges::PendingChallengeTracker::new()),
+            ip_rate_limiter: Arc::new(crate::rate_limit::IpRateLimiter::new()),
         };
 
         (state, dir)
@@ -1002,6 +1093,39 @@ mod tests {
         assert!(entry.get("did_id").is_some());
         assert_eq!(entry.get("version_count").and_then(|v| v.as_u64()), Some(1));
         assert!(entry.get("total_resolves").is_some());
+    }
+
+    /// IDOR regression: an owner whose DID is a string-prefix of another
+    /// owner's DID must NOT see the longer-DID owner's mnemonics. Owner-
+    /// index keys are `owner:{did}:{mnemonic}` and DIDs naturally contain
+    /// colons, so the prefix iteration is ambiguous between
+    /// `did:web:tenant` and `did:web:tenant:server`. `list_dids` must
+    /// re-check `record.owner == target_owner` after the iteration.
+    #[tokio::test]
+    async fn dispatch_did_op_list_request_filters_did_prefix_collision() {
+        let (state, _dir) = test_state().await;
+        let short = "did:example:tenant";
+        let long = "did:example:tenant:server";
+        seed_did(&state, short, "short-mn").await;
+        seed_did(&state, long, "long-mn").await;
+
+        // Caller is the SHORT-DID owner. Without the fix, the iterator
+        // returns both `owner:did:example:tenant:short-mn` and
+        // `owner:did:example:tenant:server:long-mn`.
+        let msg = build_msg(MSG_LIST_REQUEST, json!({}));
+        let auth = owner_auth(short);
+        let (typ, body) = dispatch_did_op(&auth, &state, &msg).await.unwrap();
+        assert_eq!(typ, MSG_LIST);
+        let dids = body.get("dids").and_then(|v| v.as_array()).expect("dids[]");
+        assert_eq!(
+            dids.len(),
+            1,
+            "prefix collision must not leak the longer-DID owner's records: {dids:?}"
+        );
+        assert_eq!(
+            dids[0].get("mnemonic").and_then(|v| v.as_str()),
+            Some("short-mn")
+        );
     }
 
     /// Admin role with no `owner` filter sees every DID across owners —
@@ -1282,6 +1406,36 @@ mod tests {
         );
     }
 
+    /// Replay gate: re-submitting the same `(sender, msg.id)` after a
+    /// successful dispatch surfaces as `e.p.did.validation-error` with
+    /// a "replay-detected" comment. Pinning this at the wrapper level
+    /// catches a regression where the replay cache is not consulted
+    /// before dispatch (e.g. a future refactor that moves the cache
+    /// check into a per-arm handler).
+    #[tokio::test]
+    async fn run_webvh_dispatch_replay_rejected() {
+        let sender = "did:example:authorized";
+        let (state, _dir, _keys) = auth_ready_state(sender, Role::Owner).await;
+        let msg = build_msg(MSG_LIST_REQUEST, json!({}));
+
+        // First call goes through.
+        let (typ, _) = run_webvh_dispatch(&state, sender, &msg).await;
+        assert_eq!(typ, MSG_LIST);
+
+        // Same `(sender, msg.id)` — replay.
+        let (typ, body) = run_webvh_dispatch(&state, sender, &msg).await;
+        assert_eq!(typ, MSG_PROBLEM_REPORT);
+        assert_eq!(
+            body.get("code").and_then(|v| v.as_str()),
+            Some("e.p.did.validation-error")
+        );
+        let comment = body.get("comment").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            comment.contains("replay-detected"),
+            "replay rejection should mention 'replay-detected', got: {comment}"
+        );
+    }
+
     /// ACL'd `MSG_LIST_REQUEST` from a sender with no DIDs returns
     /// `MSG_LIST` with an empty array — full happy-path through the ACL
     /// gate + dispatcher.
@@ -1344,24 +1498,49 @@ mod tests {
                 AppError::NotFound("did not found".into()),
                 "e.p.did.mnemonic-not-found",
             ),
+            // Tagged validations route via `ValidationKind`, not by
+            // sniffing the message text — pinning these via the
+            // `AppError::validation()` constructor ensures the tag is
+            // the load-bearing input.
             (
-                AppError::Validation("invalid log entry on line 3".into()),
+                AppError::validation(
+                    affinidi_webvh_common::server::error::ValidationKind::InvalidLog,
+                    "invalid log entry on line 3",
+                ),
                 "e.p.did.invalid-log",
             ),
             (
-                AppError::Validation("malformed JSONL body".into()),
+                AppError::validation(
+                    affinidi_webvh_common::server::error::ValidationKind::InvalidLog,
+                    "malformed JSONL body",
+                ),
                 "e.p.did.invalid-log",
             ),
             (
-                AppError::Validation("path component reserved".into()),
+                AppError::validation(
+                    affinidi_webvh_common::server::error::ValidationKind::InvalidPath,
+                    "path component reserved",
+                ),
                 "e.p.did.path-invalid",
             ),
             (
-                AppError::Validation("witness signature failed".into()),
+                AppError::validation(
+                    affinidi_webvh_common::server::error::ValidationKind::InvalidWitness,
+                    "witness signature failed",
+                ),
                 "e.p.did.witness-invalid",
             ),
             (
-                AppError::Validation("something else broke".into()),
+                AppError::validation(
+                    affinidi_webvh_common::server::error::ValidationKind::Other,
+                    "something else broke",
+                ),
+                "e.p.did.validation-error",
+            ),
+            // An untagged Validation (no `[tag]` prefix) falls through to
+            // the generic code rather than re-routing based on wording.
+            (
+                AppError::Validation("missing 'mnemonic' in body".into()),
                 "e.p.did.validation-error",
             ),
             (AppError::Internal("oops".into()), "e.p.did.internal-error"),
@@ -1373,5 +1552,221 @@ mod tests {
                 "map_app_error_code({err:?}) = {got}, expected {expected}",
             );
         }
+    }
+
+    /// `MSG_DID_CHANGE_OWNER` with no `mnemonic` body field is a validation
+    /// error — wire-level contract for malformed clients.
+    #[tokio::test]
+    async fn dispatch_did_op_change_owner_missing_mnemonic_validation() {
+        let (state, _dir) = test_state().await;
+        let msg = build_msg(
+            MSG_DID_CHANGE_OWNER,
+            json!({ "new_owner": "did:example:new" }),
+        );
+        let auth = owner_auth("did:example:caller");
+
+        let err = dispatch_did_op(&auth, &state, &msg).await.unwrap_err();
+        assert!(matches!(err, AppError::Validation(ref m) if m.contains("mnemonic")));
+    }
+
+    /// `MSG_DID_CHANGE_OWNER` with no `new_owner` body field is a validation
+    /// error.
+    #[tokio::test]
+    async fn dispatch_did_op_change_owner_missing_new_owner_validation() {
+        let (state, _dir) = test_state().await;
+        let msg = build_msg(MSG_DID_CHANGE_OWNER, json!({ "mnemonic": "alpha-beta" }));
+        let auth = owner_auth("did:example:caller");
+
+        let err = dispatch_did_op(&auth, &state, &msg).await.unwrap_err();
+        assert!(matches!(err, AppError::Validation(ref m) if m.contains("new_owner")));
+    }
+
+    /// Owner can transfer their own DID to another ACL'd DID. Confirms the
+    /// success path and the wire-level confirm body shape.
+    #[tokio::test]
+    async fn dispatch_did_op_change_owner_success() {
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:owner-a";
+        let new_owner = "did:example:owner-b";
+        seed_did(&state, owner, "alpha-beta").await;
+
+        // Both old and new owners must be in the ACL for change-owner to
+        // succeed — defense-in-depth.
+        store_acl_entry(
+            &state.acl_ks,
+            &AclEntry {
+                did: new_owner.into(),
+                role: Role::Owner,
+                label: None,
+                created_at: 0,
+                max_total_size: None,
+                max_did_count: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let msg = build_msg(
+            MSG_DID_CHANGE_OWNER,
+            json!({ "mnemonic": "alpha-beta", "new_owner": new_owner }),
+        );
+        let auth = owner_auth(owner);
+
+        let (typ, body) = dispatch_did_op(&auth, &state, &msg).await.unwrap();
+        assert_eq!(typ, MSG_DID_CHANGE_OWNER_CONFIRM);
+        assert_eq!(body.get("owner").and_then(|v| v.as_str()), Some(new_owner));
+
+        // Owner index swapped: old owner has none, new owner has one.
+        let old_idx = state
+            .dids_ks
+            .prefix_iter_raw(format!("owner:{owner}:"))
+            .await
+            .unwrap();
+        assert!(old_idx.is_empty(), "old owner index should be cleared");
+        let new_idx = state
+            .dids_ks
+            .prefix_iter_raw(format!("owner:{new_owner}:"))
+            .await
+            .unwrap();
+        assert_eq!(new_idx.len(), 1, "new owner should have one entry");
+    }
+
+    /// Cross-owner change-owner is forbidden — only the current owner or an
+    /// admin may transfer.
+    #[tokio::test]
+    async fn dispatch_did_op_change_owner_cross_owner_forbidden() {
+        let (state, _dir) = test_state().await;
+        seed_did(&state, "did:example:owner-a", "alpha-beta").await;
+        store_acl_entry(
+            &state.acl_ks,
+            &AclEntry {
+                did: "did:example:target".into(),
+                role: Role::Owner,
+                label: None,
+                created_at: 0,
+                max_total_size: None,
+                max_did_count: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let msg = build_msg(
+            MSG_DID_CHANGE_OWNER,
+            json!({ "mnemonic": "alpha-beta", "new_owner": "did:example:target" }),
+        );
+        let attacker = owner_auth("did:example:attacker");
+
+        let err = dispatch_did_op(&attacker, &state, &msg).await.unwrap_err();
+        assert!(matches!(err, AppError::Forbidden(_)));
+        assert_eq!(map_app_error_code(&err), "e.p.did.unauthorized");
+    }
+
+    /// New owner must be in the ACL — prevents transferring a DID to an
+    /// identity that can never authenticate to claim it.
+    #[tokio::test]
+    async fn dispatch_did_op_change_owner_unknown_new_owner_validation() {
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:owner-a";
+        seed_did(&state, owner, "alpha-beta").await;
+
+        let msg = build_msg(
+            MSG_DID_CHANGE_OWNER,
+            json!({ "mnemonic": "alpha-beta", "new_owner": "did:example:not-in-acl" }),
+        );
+        let auth = owner_auth(owner);
+
+        let err = dispatch_did_op(&auth, &state, &msg).await.unwrap_err();
+        assert!(matches!(err, AppError::Validation(ref m) if m.contains("not in the ACL")));
+    }
+
+    /// Force-replace via `MSG_DID_REQUEST` with `force: true` succeeds when
+    /// the requester is the current owner, replacing the existing slot.
+    #[tokio::test]
+    async fn dispatch_did_op_did_request_force_replaces_when_owner() {
+        let (state, _dir) = test_state().await;
+        let owner = "did:example:owner-a";
+        seed_did(&state, owner, "shared-path").await;
+        // Seed log content so we can verify it gets cleared.
+        state
+            .dids_ks
+            .insert_raw(
+                affinidi_webvh_common::did_ops::content_log_key("shared-path"),
+                b"old log".to_vec(),
+            )
+            .await
+            .unwrap();
+
+        let msg = build_msg(
+            MSG_DID_REQUEST,
+            json!({ "path": "shared-path", "force": true }),
+        );
+        let auth = owner_auth(owner);
+
+        let (typ, body) = dispatch_did_op(&auth, &state, &msg).await.unwrap();
+        assert_eq!(typ, MSG_DID_OFFER);
+        assert_eq!(
+            body.get("mnemonic").and_then(|v| v.as_str()),
+            Some("shared-path")
+        );
+
+        // Old log content has been wiped; new record has version_count 0.
+        let log = state
+            .dids_ks
+            .get_raw(affinidi_webvh_common::did_ops::content_log_key(
+                "shared-path",
+            ))
+            .await
+            .unwrap();
+        assert!(log.is_none(), "old log content should be wiped");
+        let record: DidRecord = state
+            .dids_ks
+            .get(did_key("shared-path"))
+            .await
+            .unwrap()
+            .expect("record present");
+        assert_eq!(record.version_count, 0);
+        assert_eq!(record.owner, owner);
+    }
+
+    /// Force-replace by a different owner is forbidden — `force` only works
+    /// for admin or current owner of the existing path.
+    #[tokio::test]
+    async fn dispatch_did_op_did_request_force_forbidden_for_other_owner() {
+        let (state, _dir) = test_state().await;
+        seed_did(&state, "did:example:owner-a", "shared-path").await;
+
+        let msg = build_msg(
+            MSG_DID_REQUEST,
+            json!({ "path": "shared-path", "force": true }),
+        );
+        let auth = owner_auth("did:example:owner-b");
+
+        let err = dispatch_did_op(&auth, &state, &msg).await.unwrap_err();
+        assert!(matches!(err, AppError::Forbidden(_)));
+    }
+
+    /// Admins can force-replace any DID — the caller becomes the new owner.
+    #[tokio::test]
+    async fn dispatch_did_op_did_request_force_admin_takes_ownership() {
+        let (state, _dir) = test_state().await;
+        seed_did(&state, "did:example:owner-a", "shared-path").await;
+
+        let admin = admin_auth("did:example:admin");
+        let msg = build_msg(
+            MSG_DID_REQUEST,
+            json!({ "path": "shared-path", "force": true }),
+        );
+
+        let (typ, _body) = dispatch_did_op(&admin, &state, &msg).await.unwrap();
+        assert_eq!(typ, MSG_DID_OFFER);
+
+        let record: DidRecord = state
+            .dids_ks
+            .get(did_key("shared-path"))
+            .await
+            .unwrap()
+            .expect("record present");
+        assert_eq!(record.owner, "did:example:admin");
     }
 }

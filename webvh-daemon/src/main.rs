@@ -420,6 +420,10 @@ async fn run_daemon(config_path: Option<PathBuf>) {
         error!("failed to open stats keyspace: {e}");
         std::process::exit(1);
     });
+    let timeseries_ks = main_store.keyspace("timeseries").unwrap_or_else(|e| {
+        error!("failed to open timeseries keyspace: {e}");
+        std::process::exit(1);
+    });
 
     // ── Phase 1: Pre-serve initialization ─────────────────────────────
 
@@ -569,6 +573,7 @@ async fn run_daemon(config_path: Option<PathBuf>) {
             &main_store,
             &stats_collector,
             &stats_ks,
+            &timeseries_ks,
             &http_client,
         )
         .await
@@ -639,6 +644,7 @@ async fn run_daemon(config_path: Option<PathBuf>) {
             sessions_ks,
             dids_ks: dids_ks.clone(),
             stats_ks,
+            timeseries_ks: timeseries_ks.clone(),
             auth_config: config.auth.clone(),
             has_auth: config.server_did.is_some(),
             collector: stats_collector.clone(),
@@ -661,10 +667,13 @@ async fn run_daemon(config_path: Option<PathBuf>) {
     let (http_ready_tx, http_ready_rx) = tokio::sync::oneshot::channel::<()>();
     let http_handle = tokio::spawn(async move {
         let _ = http_ready_tx.send(());
-        axum::serve(listener, app)
-            .with_graceful_shutdown(init::shutdown_signal())
-            .await
-            .expect("axum serve failed");
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(init::shutdown_signal())
+        .await
+        .expect("axum serve failed");
     });
 
     // Wait for HTTP to be serving before starting DIDComm — the mediator DID
@@ -742,6 +751,7 @@ struct DaemonStorageParams {
     sessions_ks: KeyspaceHandle,
     dids_ks: KeyspaceHandle,
     stats_ks: KeyspaceHandle,
+    timeseries_ks: KeyspaceHandle,
     auth_config: affinidi_webvh_common::server::config::AuthConfig,
     has_auth: bool,
     collector: Arc<StatsCollector>,
@@ -796,6 +806,7 @@ async fn run_daemon_storage_task(
                 if let Err(e) = affinidi_webvh_control::server::flush_stats_to_store(
                     &params.collector,
                     &params.stats_ks,
+                    &params.timeseries_ks,
                     &params.dids_ks,
                     &params.store,
                 ).await {
@@ -813,6 +824,7 @@ async fn run_daemon_storage_task(
     let _ = affinidi_webvh_control::server::flush_stats_to_store(
         &params.collector,
         &params.stats_ks,
+        &params.timeseries_ks,
         &params.dids_ks,
         &params.store,
     )
@@ -938,6 +950,7 @@ async fn build_control(
     store: &Store,
     stats_collector: &Arc<StatsCollector>,
     stats_ks: &KeyspaceHandle,
+    timeseries_ks: &KeyspaceHandle,
     http_client: &reqwest::Client,
 ) -> Result<(Router, affinidi_webvh_control::server::AppState), AppError> {
     use affinidi_webvh_control::server::AppState;
@@ -982,7 +995,14 @@ async fn build_control(
         didcomm_service: Arc::new(std::sync::OnceLock::new()),
         stats_collector: stats_collector.clone(),
         stats_ks: stats_ks.clone(),
+        timeseries_ks: timeseries_ks.clone(),
         signing_key_bytes: init::decode_multibase_ed25519_key(&secrets.signing_key).ok(),
+        replay_cache: Arc::new(affinidi_webvh_control::replay::ReplayCache::new()),
+        path_locks: affinidi_webvh_control::path_locks::PathLocks::new(),
+        pending_challenges: Arc::new(
+            affinidi_webvh_control::pending_challenges::PendingChallengeTracker::new(),
+        ),
+        ip_rate_limiter: Arc::new(affinidi_webvh_control::rate_limit::IpRateLimiter::new()),
     };
 
     // Seed registry from static config
@@ -1314,9 +1334,16 @@ async fn run_recreate_did(
     let store = Store::open(&config.store).await?;
     let dids_ks = store.keyspace("dids")?;
 
-    // Delete existing DID at this path
+    // Delete existing DID at this path. Read the record first so we can
+    // remove the correct `owner:{owner}:{mnemonic}` reverse-index entry —
+    // hard-coding `"system"` (the owner string used by the auto-bootstrap
+    // path) would leak the index for any DID that was created with a
+    // different owner.
     let did_key = affinidi_webvh_server::did_ops::did_key(&mnemonic);
-    if dids_ks.contains_key(did_key.clone()).await? {
+    if let Some(existing) = dids_ks
+        .get::<affinidi_webvh_common::did_ops::DidRecord>(did_key.clone())
+        .await?
+    {
         dids_ks.remove(did_key).await?;
         dids_ks
             .remove(affinidi_webvh_server::did_ops::content_log_key(&mnemonic))
@@ -1328,7 +1355,8 @@ async fn run_recreate_did(
             .await?;
         dids_ks
             .remove(affinidi_webvh_server::did_ops::owner_key(
-                "system", &mnemonic,
+                &existing.owner,
+                &mnemonic,
             ))
             .await?;
         eprintln!("  Removed existing DID at path '{mnemonic}'");
@@ -1390,7 +1418,7 @@ async fn run_recover_did(
     let store = Store::open(&config.store).await?;
     let dids_ks = store.keyspace("dids")?;
 
-    let did_key = format!("did:{mnemonic}");
+    let did_key = affinidi_webvh_common::did_ops::did_key(&mnemonic);
     let mut record: DidRecord = dids_ks
         .get(did_key.as_str())
         .await?

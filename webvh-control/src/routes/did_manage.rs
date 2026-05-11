@@ -8,7 +8,9 @@ use crate::error::AppError;
 use crate::server::AppState;
 use crate::server_push;
 use affinidi_webvh_common::did_ops::LogMetadata;
-use affinidi_webvh_common::{CheckNameResponse, DidListEntry, RequestUriResponse};
+use affinidi_webvh_common::{
+    CheckNameResponse, DidListEntry, DidRegisterRequest, DidRegisterResponse, RequestUriResponse,
+};
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -42,6 +44,10 @@ pub async fn check_name(
 #[derive(Debug, Deserialize, Default)]
 pub struct RequestUriRequest {
     pub path: Option<String>,
+    /// When true and `path` already exists, replaces the existing DID slot
+    /// (caller must be admin or current owner of that path).
+    #[serde(default)]
+    pub force: bool,
 }
 
 pub async fn request_uri(
@@ -49,10 +55,50 @@ pub async fn request_uri(
     State(state): State<AppState>,
     body: Option<Json<RequestUriRequest>>,
 ) -> Result<(StatusCode, Json<RequestUriResponse>), AppError> {
-    let path = body.and_then(|b| b.0.path);
-    let result = did_ops::create_did(&auth, &state, path.as_deref()).await?;
+    let (path, force) = match body {
+        Some(Json(b)) => (b.path, b.force),
+        None => (None, false),
+    };
+    let result = did_ops::create_did(&auth, &state, path.as_deref(), force).await?;
+
+    // No `notify_servers_delete` on force-replace: `create_did` only
+    // reserves the mnemonic, so a delete fan-out would make downstream
+    // resolvers serve 404 until the caller's follow-up `publish_did`
+    // arrives. Atomic ownership-takeover with no resolvability gap is
+    // `POST /api/dids/register` (`register_did_atomic`).
 
     Ok((StatusCode::CREATED, Json(result)))
+}
+
+// ---------- POST /api/dids/register ----------
+
+/// Atomic claim-and-publish — see [`did_ops::register_did_atomic`] for the
+/// full contract. The handler returns 200 (not 201) because the operation
+/// is intentionally idempotent for the slot's owner; second-and-subsequent
+/// calls just bump `version_count` and replace content.
+pub async fn register_did(
+    auth: AuthClaims,
+    State(state): State<AppState>,
+    Json(req): Json<DidRegisterRequest>,
+) -> Result<Json<DidRegisterResponse>, AppError> {
+    let result =
+        did_ops::register_did_atomic(&auth, &state, &req.path, &req.did_log, req.force).await?;
+
+    // Push the (potentially replaced) log to downstream servers so their
+    // resolvers see the new content right away. Same as `upload_did`.
+    server_push::notify_servers_did(&state, result.mnemonic.clone());
+
+    info!(
+        did = %auth.did,
+        path = %result.mnemonic,
+        force = req.force,
+        "DID atomically registered via REST"
+    );
+
+    Ok(Json(DidRegisterResponse {
+        mnemonic: result.mnemonic,
+        did_url: result.did_url,
+    }))
 }
 
 // ---------- GET /api/dids/{mnemonic} ----------
@@ -141,6 +187,36 @@ pub async fn delete_did(
     did_ops::delete_did(&auth, &state, mnemonic).await?;
     server_push::notify_servers_delete(&state, mnemonic.to_string());
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------- PUT /api/owner/{mnemonic} ----------
+
+#[derive(Debug, Deserialize)]
+pub struct ChangeOwnerRequest {
+    pub new_owner: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangeOwnerResponse {
+    pub mnemonic: String,
+    pub owner: String,
+    pub updated_at: u64,
+}
+
+pub async fn change_owner(
+    auth: AuthClaims,
+    State(state): State<AppState>,
+    Path(mnemonic): Path<String>,
+    Json(req): Json<ChangeOwnerRequest>,
+) -> Result<Json<ChangeOwnerResponse>, AppError> {
+    let mnemonic = clean_mnemonic(&mnemonic);
+    let record = did_ops::change_did_owner(&auth, &state, mnemonic, &req.new_owner).await?;
+    Ok(Json(ChangeOwnerResponse {
+        mnemonic: record.mnemonic,
+        owner: record.owner,
+        updated_at: record.updated_at,
+    }))
 }
 
 // ---------- PUT /api/disable/{mnemonic} ----------
@@ -308,7 +384,7 @@ pub async fn get_server_timeseries(
     State(state): State<AppState>,
     Query(params): Query<TimeseriesQuery>,
 ) -> Result<Json<Vec<TimeSeriesPoint>>, AppError> {
-    let points = query_timeseries(&state.stats_ks, "_all", &params.range).await?;
+    let points = query_timeseries(&state.timeseries_ks, "_all", &params.range).await?;
     Ok(Json(points))
 }
 
@@ -320,13 +396,18 @@ pub async fn get_did_timeseries(
     Query(params): Query<TimeseriesQuery>,
 ) -> Result<Json<Vec<TimeSeriesPoint>>, AppError> {
     let mnemonic = mnemonic.trim_start_matches('/');
-    let points = query_timeseries(&state.stats_ks, mnemonic, &params.range).await?;
+    let points = query_timeseries(&state.timeseries_ks, mnemonic, &params.range).await?;
     Ok(Json(points))
 }
 
 /// Query time-series buckets for a given mnemonic and range.
+///
+/// Reads from the `timeseries_ks` keyspace (split out from
+/// `stats_ks` in v0.7); the rows have shape
+/// `ts:{mnemonic}:{bucket_epoch} -> {r,u}`. The literal `mnemonic`
+/// `_all` is the server-wide aggregate.
 async fn query_timeseries(
-    stats_ks: &affinidi_webvh_common::server::store::KeyspaceHandle,
+    timeseries_ks: &affinidi_webvh_common::server::store::KeyspaceHandle,
     mnemonic: &str,
     range: &str,
 ) -> Result<Vec<TimeSeriesPoint>, AppError> {
@@ -355,7 +436,7 @@ async fn query_timeseries(
     let end = now / 300 * 300;
 
     let prefix = format!("ts:{mnemonic}:");
-    let raw = stats_ks.prefix_iter_raw(prefix.as_str()).await?;
+    let raw = timeseries_ks.prefix_iter_raw(prefix.as_str()).await?;
 
     // Collect raw buckets within range
     let prefix_len = prefix.len();
