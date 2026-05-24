@@ -1,9 +1,10 @@
 [workspace]
 members = [
-  "webvh-common",
-  "webvh-control",
-  "webvh-daemon",
-  "webvh-server",
+  "did-hosting-client",
+  "did-hosting-common",
+  "did-hosting-control",
+  "did-hosting-daemon",
+  "did-hosting-server",
   "webvh-watcher",
   "webvh-witness",
 ]
@@ -17,7 +18,7 @@ readme = "README.md"
 homepage = "https://affinidi.com/"
 license = "Apache-2.0"
 keywords = ["ssi", "affinidi", "webvh"]
-repository = "https://github.com/affinidi/affinidi-webvh-service"
+repository = "https://github.com/affinidi/did-hosting-service"
 publish = true
 rust-version = "1.95.0"
 
@@ -104,8 +105,14 @@ anyhow = "1"
 # DID WebVH
 didwebvh-rs = "0.5"
 
-# VTA SDK
-vta-sdk = { version = "0.6", features = [
+# VTA SDK — 0.7 on crates.io, published 2026-05-24 alongside
+# vti-common 0.7 (OpenVTC/verifiable-trust-infrastructure#113 +
+# #115). Carries the canonical SIOPv2 / RFC 6749 wire types
+# (`protocols::auth::{Session, TokenBundle, AuthenticateResponse,
+# ChallengeResponse, epoch_to_rfc3339}`) that the cross-repo
+# auth-architecture work introduced. The git-pinned rev that
+# lived here through the pre-publish window is gone.
+vta-sdk = { version = "0.7", features = [
   "session",
   "provision-integration",
   "provision-client",
@@ -114,6 +121,26 @@ vta-sdk = { version = "0.6", features = [
 # Logging / tracing
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Trust Tasks (DTGWG, ToIP). Now on crates.io at 0.1.1 (DTGWG
+# PR #36 merged + published 2026-05-24); the `[patch.crates-io]`
+# git pin that lived here through the pre-publish window is gone.
+# Bump to 0.1.x in lockstep with verifiable-trust-infrastructure
+# when upstream publishes new patch releases.
+#
+# `validate` feature: deliberately NOT enabled. The codegen-emitted
+# `Payload` structs use `#[serde(deny_unknown_fields)]` plus newtype
+# wrappers that reject `minLength: 1` / regex constraints at
+# deserialise time, so we get framework-shape + payload-shape
+# validation as a side-effect of typed dispatch. The `validate`
+# feature would add JSON-Schema-driven validation against the
+# embedded schema string per request — redundant for our consumers
+# and a compile-time tax we don't pay. Re-enable if a future spec
+# carries constraints not captured by the codegen newtypes.
+trust-tasks-rs = { version = "0.1", default-features = false }
+trust-tasks-https = { version = "0.1", default-features = false, features = ["server", "client", "jwt"] }
+trust-tasks-didcomm = { version = "0.1", default-features = false }
+trust-tasks-proof = { version = "0.1", default-features = false, features = ["affinidi"] }
 
 [profile.release]
 # Tell `rustc` to optimize for small code size.
