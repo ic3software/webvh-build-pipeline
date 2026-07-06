@@ -296,6 +296,9 @@ async fn generate_self_managed_keys(recipe: &SetupRecipe) -> Result<VtaSetupOutc
         &DidDocumentOptions {
             key_agreement_multibase: Some(&ka_pub_mb),
             mediator_endpoint: recipe.identity.mediator_did.as_deref(),
+            // TSP rides with DIDComm: advertise `TSPTransport` at the same
+            // mediator whenever DIDComm is present (matches the VTA templates).
+            tsp_endpoint: recipe.identity.mediator_did.as_deref(),
         },
     );
     let (_scid, jsonl) = create_log_entry(&doc, &signing)

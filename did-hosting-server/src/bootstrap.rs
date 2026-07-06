@@ -94,6 +94,10 @@ pub async fn bootstrap_did(
         &DidDocumentOptions {
             key_agreement_multibase: ka_public_key.as_deref(),
             mediator_endpoint: mediator_did,
+            // TSP rides with DIDComm: advertise a `TSPTransport` service
+            // (pointing at the same mediator) whenever DIDComm is present,
+            // matching the VTA webvh templates.
+            tsp_endpoint: mediator_did,
         },
     );
 
