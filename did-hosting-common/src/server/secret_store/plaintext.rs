@@ -36,6 +36,7 @@ impl PlaintextSecretStore {
                 key_agreement_key: p.key_agreement_key.clone(),
                 jwt_signing_key: p.jwt_signing_key.clone(),
                 vta_credential: p.vta_credential.clone(),
+                retired: p.retired.clone(),
             }),
             config_path,
         }
@@ -43,9 +44,38 @@ impl PlaintextSecretStore {
 }
 
 impl SecretStore for PlaintextSecretStore {
+    /// Read the secrets, preferring the **file** over the construction-time
+    /// snapshot.
+    ///
+    /// The snapshot comes from the `AppConfig` a caller happened to be holding,
+    /// which goes stale the moment anything writes new key material — and the
+    /// thing that writes it (`import-secrets`) runs in a *different process*.
+    /// A running service reloading its identity would otherwise read the keys it
+    /// booted with, fail to match them against the freshly-published DID
+    /// document, and refuse the rotation with a message blaming the operator for
+    /// an ordering mistake they did not make.
+    ///
+    /// This mirrors `get_bootstrap_seed`, which already re-reads the file for
+    /// exactly this reason (the offline-wizard staleness bug). The file is the
+    /// source of truth in plaintext mode; the snapshot is only a fallback for
+    /// callers constructed without a readable config path.
     fn get(&self) -> BoxFuture<'_, Result<Option<ServerSecrets>, AppError>> {
-        let secrets = self.secrets.clone();
-        Box::pin(async move { Ok(secrets) })
+        let snapshot = self.secrets.clone();
+        let config_path = self.config_path.clone();
+        Box::pin(async move {
+            match read_plaintext_secrets(&config_path).await {
+                Ok(Some(from_file)) => Ok(Some(from_file)),
+                // No `[secrets.plaintext]` on disk, or the file is unreadable —
+                // fall back rather than pretending the service has no secrets.
+                Ok(None) => Ok(snapshot),
+                Err(e) => {
+                    warn!(
+                        "failed to re-read plaintext secrets from config ({e}) — using the snapshot"
+                    );
+                    Ok(snapshot)
+                }
+            }
+        })
     }
 
     fn set(&self, secrets: &ServerSecrets) -> BoxFuture<'_, Result<(), AppError>> {
@@ -67,12 +97,16 @@ impl SecretStore for PlaintextSecretStore {
                 ))
             })?;
 
-            // Build the plaintext secrets value (preserving vta_credential).
+            // Build the plaintext secrets value (preserving vta_credential and
+            // the retired key material — dropping the latter here would lose
+            // the outgoing key on the very write that installs its
+            // replacement, which is the one write that must not lose it).
             let plaintext = PlaintextSecrets {
                 signing_key: secrets.signing_key,
                 key_agreement_key: secrets.key_agreement_key,
                 jwt_signing_key: secrets.jwt_signing_key,
                 vta_credential: secrets.vta_credential,
+                retired: secrets.retired,
             };
 
             let plaintext_value = toml::Value::try_from(&plaintext).map_err(|e| {
@@ -128,6 +162,49 @@ impl SecretStore for PlaintextSecretStore {
         let config_path = self.config_path.clone();
         Box::pin(async move { write_plaintext_seed_field(&config_path, None).await })
     }
+}
+
+/// Read `[secrets.plaintext]` from `config_path`.
+///
+/// Returns `Ok(None)` when the file is missing or carries no plaintext secrets —
+/// the caller then falls back to its construction-time snapshot.
+async fn read_plaintext_secrets(
+    config_path: &std::path::Path,
+) -> Result<Option<ServerSecrets>, AppError> {
+    let contents = match tokio::fs::read_to_string(config_path).await {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(AppError::Config(format!(
+                "failed to read config file {}: {e}",
+                config_path.display()
+            )));
+        }
+    };
+
+    let doc: toml::Value = toml::from_str(&contents).map_err(|e| {
+        AppError::Config(format!(
+            "failed to parse config file {}: {e}",
+            config_path.display()
+        ))
+    })?;
+
+    let Some(value) = doc.get("secrets").and_then(|s| s.get("plaintext")) else {
+        return Ok(None);
+    };
+
+    let plaintext: PlaintextSecrets = value
+        .clone()
+        .try_into()
+        .map_err(|e| AppError::Config(format!("failed to parse [secrets.plaintext]: {e}")))?;
+
+    Ok(Some(ServerSecrets {
+        signing_key: plaintext.signing_key,
+        key_agreement_key: plaintext.key_agreement_key,
+        jwt_signing_key: plaintext.jwt_signing_key,
+        vta_credential: plaintext.vta_credential,
+        retired: plaintext.retired,
+    }))
 }
 
 /// Read `[secrets].plaintext_bootstrap_seed` from `config_path`. Returns
@@ -263,6 +340,7 @@ mod tests {
             key_agreement_key: "z6LStest_agreement".into(),
             jwt_signing_key: "z6Mktest_jwt".into(),
             vta_credential: None,
+            retired: Vec::new(),
         }
     }
 
@@ -272,6 +350,7 @@ mod tests {
             key_agreement_key: "z6LStest_agreement".into(),
             jwt_signing_key: "z6Mktest_jwt".into(),
             vta_credential: None,
+            retired: Vec::new(),
         }
     }
 
@@ -280,6 +359,56 @@ mod tests {
         let store = PlaintextSecretStore::new(None, PathBuf::from("nonexistent.toml"));
         let result = store.get().await.unwrap();
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn set_preserves_retired_key_material() {
+        // A rotation writes the outgoing key into `retired` in the *same* call
+        // that installs its replacement — there is no compare-and-swap, so this
+        // is the one write that must not lose it. An earlier draft of this
+        // backend rebuilt `PlaintextSecrets` with `retired: Vec::new()`, which
+        // silently dropped the old private key on exactly that write and left a
+        // restart mid-rotation unable to decrypt traffic still addressed to it.
+        use crate::server::secret_store::RetiredKeys;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        tokio::fs::write(&config_path, "[server]\nport = 8080\n")
+            .await
+            .expect("seed config");
+
+        let store = PlaintextSecretStore::new(None, config_path.clone());
+
+        let mut secrets = sample_secrets();
+        secrets.retired = vec![RetiredKeys {
+            ka_kid: "did:webvh:example:alpha#z6LSold".into(),
+            key_agreement_key: "z6LSold_private".into(),
+            signing_kid: "did:webvh:example:alpha#z6Mkold".into(),
+            signing_key: "z6Mkold_private".into(),
+        }];
+
+        store.set(&secrets).await.expect("write secrets");
+
+        // Re-read through the config file, as a fresh boot would.
+        let contents = tokio::fs::read_to_string(&config_path)
+            .await
+            .expect("read config");
+        let parsed: toml::Value = toml::from_str(&contents).expect("parse config");
+        let plaintext: PlaintextSecrets = parsed["secrets"]["plaintext"]
+            .clone()
+            .try_into()
+            .expect("plaintext secrets present");
+
+        assert_eq!(
+            plaintext.retired.len(),
+            1,
+            "retired key material must survive the write that installs its replacement"
+        );
+        assert_eq!(
+            plaintext.retired[0].ka_kid,
+            "did:webvh:example:alpha#z6LSold"
+        );
+        assert_eq!(plaintext.retired[0].key_agreement_key, "z6LSold_private");
     }
 
     #[tokio::test]
