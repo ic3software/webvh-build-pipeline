@@ -670,10 +670,16 @@ where
                         .with_message("register requires a non-empty `path`"),
                 ));
             }
-            let result =
-                did_ops::register_did_atomic(&auth, &state, &req.path, &req.did_log, req.force)
-                    .await
-                    .map_err(|e| reject_apperror(&doc, e))?;
+            let result = did_ops::register_did_atomic(
+                &auth,
+                &state,
+                &req.path,
+                &req.did_log,
+                req.force,
+                None,
+            )
+            .await
+            .map_err(|e| reject_apperror(&doc, e))?;
             crate::server_push::notify_servers_did(&state, result.mnemonic.clone());
             let server_did = state.config.server_did.clone().unwrap_or_default();
             Ok(doc.respond_with(
@@ -915,6 +921,13 @@ fn resolve_state<P>(
 /// and check the maintainer ACL, returning an `AuthClaims` for the
 /// `did_ops::*` calls. The same authorisation gate the legacy transport
 /// applies before `dispatch_did_op`.
+// `ErrorResponse` is the upstream `TrustTask<ErrorPayload>` (832 bytes
+// here), which `result_large_err` started flagging in Rust 1.98.0. Same
+// reasoning as the allow on `trust_tasks::handlers` in
+// `did-hosting-common`: the type is upstream, and boxing it at this
+// boundary would churn every caller to save one move on a path that is
+// about to serialise the error onto the wire anyway.
+#[allow(clippy::result_large_err)]
 async fn authorize<P>(
     state: &AppState,
     doc: &TrustTask<P>,
