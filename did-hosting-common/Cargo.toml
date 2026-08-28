@@ -136,11 +136,11 @@ tracing-subscriber = { workspace = true, optional = true }
 hex = { version = "0.4", optional = true }
 toml = "1.0"
 
-# Trust Tasks framework — see workspace Cargo.toml for version pin and
-# [patch.crates-io] block. Gated behind `server-core` because the
-# dispatcher only runs on the server side; the client (no trust-tasks
-# admin surface yet) ignores them. Re-evaluate when we add a typed
-# client builder for outbound trust-task documents.
+# Trust Tasks framework — see workspace Cargo.toml for the version pin.
+# Gated behind `server-core` because the dispatcher only runs on the
+# server side; the client (no trust-tasks admin surface yet) ignores
+# them. Re-evaluate when we add a typed client builder for outbound
+# trust-task documents.
 trust-tasks-rs = { workspace = true, optional = true }
 trust-tasks-https = { workspace = true, optional = true }
 trust-tasks-didcomm = { workspace = true, optional = true }
